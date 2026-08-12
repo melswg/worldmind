@@ -2,6 +2,7 @@ package io.github.melswg.worldmind.testkit;
 
 import io.github.melswg.worldmind.core.conversation.ConversationApplicationService;
 import io.github.melswg.worldmind.core.conversation.ConversationOutcome;
+import io.github.melswg.worldmind.core.conversation.LanguageModel;
 import io.github.melswg.worldmind.core.conversation.NormalizedServerRequest;
 import io.github.melswg.worldmind.core.conversation.ProviderCapabilities;
 import io.github.melswg.worldmind.core.conversation.ServerRequester;
@@ -18,14 +19,25 @@ import java.util.concurrent.CompletionStage;
  * Reusable high-level DSL for server-side Worldmind acceptance scenarios.
  */
 public final class WorldmindAcceptanceScenario {
-    private final FakeLanguageModel languageModel = new FakeLanguageModel();
+    private final LanguageModel languageModel;
     private final DeterministicScheduler serverScheduler = new DeterministicScheduler();
     private final ControlledClock clock = ControlledClock.startingAt(Instant.EPOCH);
-    private final ConversationApplicationService applicationService =
-        new ConversationApplicationService(languageModel, serverScheduler);
+    private final ConversationApplicationService applicationService;
+
+    public WorldmindAcceptanceScenario() {
+        this(new FakeLanguageModel());
+    }
+
+    public WorldmindAcceptanceScenario(LanguageModel languageModel) {
+        this.languageModel = java.util.Objects.requireNonNull(languageModel, "languageModel");
+        this.applicationService = new ConversationApplicationService(this.languageModel, serverScheduler);
+    }
 
     public FakeLanguageModel languageModel() {
-        return languageModel;
+        if (languageModel instanceof FakeLanguageModel fakeLanguageModel) {
+            return fakeLanguageModel;
+        }
+        throw new IllegalStateException("This scenario uses an injected language model rather than FakeLanguageModel.");
     }
 
     public DeterministicScheduler serverScheduler() {

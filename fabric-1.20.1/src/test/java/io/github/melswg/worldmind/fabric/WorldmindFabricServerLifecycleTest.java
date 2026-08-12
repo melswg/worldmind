@@ -75,8 +75,9 @@ class WorldmindFabricServerLifecycleTest {
               "activeProfile": "oracle",
               "provider": {
                 "id": "custom-openai-compatible",
+                "endpoint": "https://api.example.invalid/v1/chat/completions",
                 "model": "example-model",
-                "secretReference": "server-managed-reference",
+                "secretReference": "env:WORLDMIND_TEST_KEY",
                 "generation": {}
               }
             }

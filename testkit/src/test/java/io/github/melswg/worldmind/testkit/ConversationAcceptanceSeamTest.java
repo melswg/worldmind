@@ -10,6 +10,7 @@ import io.github.melswg.worldmind.core.configuration.ExternalSecretReference;
 import io.github.melswg.worldmind.core.configuration.GenerationParameters;
 import io.github.melswg.worldmind.core.configuration.LoreMaterial;
 import io.github.melswg.worldmind.core.configuration.ProviderConfiguration;
+import io.github.melswg.worldmind.core.configuration.ProviderEndpoint;
 import io.github.melswg.worldmind.core.configuration.ResponseLengthLimit;
 import io.github.melswg.worldmind.core.configuration.ValidatedWorldmindConfiguration;
 import io.github.melswg.worldmind.core.configuration.WorldmindGlobalConfiguration;
@@ -27,6 +28,7 @@ import io.github.melswg.worldmind.core.conversation.SafeServerResponse;
 import io.github.melswg.worldmind.core.conversation.WorldIdentity;
 import java.time.Duration;
 import java.time.Instant;
+import java.net.URI;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -124,7 +126,7 @@ class ConversationAcceptanceSeamTest {
         );
         assertFalse(providerVisibleText(providerRequest).contains(PLAYER_ID.toString()));
         assertFalse(providerVisibleText(providerRequest).contains(WORLD_ID.stableId()));
-        assertFalse(providerVisibleText(providerRequest).contains("server-managed-reference"));
+        assertFalse(providerVisibleText(providerRequest).contains("env:WORLDMIND_ACCEPTANCE_KEY"));
         assertEquals(Instant.EPOCH.plus(Duration.ofMinutes(5)), scenario.clock().instant());
         assertFalse(outcome.toCompletableFuture().isDone());
 
@@ -295,9 +297,10 @@ class ConversationAcceptanceSeamTest {
                 "acceptance-profile",
                 new ProviderConfiguration(
                     "custom-openai-compatible",
+                    new ProviderEndpoint(URI.create("https://api.example.invalid/v1/chat/completions")),
                     "example-model",
                     new GenerationParameters(Optional.of(0.4), Optional.empty(), Optional.of(120)),
-                    new ExternalSecretReference("server-managed-reference")
+                    new ExternalSecretReference("env:WORLDMIND_ACCEPTANCE_KEY")
                 )
             ),
             profile

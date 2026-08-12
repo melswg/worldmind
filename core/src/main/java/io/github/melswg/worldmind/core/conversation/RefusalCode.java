@@ -4,5 +4,6 @@ package io.github.melswg.worldmind.core.conversation;
 public enum RefusalCode {
     PROVIDER_INCOMPATIBLE,
     PROVIDER_UNAVAILABLE,
+    INVALID_PROVIDER_RESPONSE,
     EMPTY_RESPONSE
 }

@@ -1,0 +1,128 @@
+package io.github.melswg.worldmind.testkit;
+
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
+
+/**
+ * Loopback-only Chat Completions fake for transport contract tests. Captured
+ * request data intentionally never exposes an authorization value.
+ */
+public final class FakeOpenAiCompatibleHttpServer implements AutoCloseable {
+    private final HttpServer server;
+    private final CompletableFuture<CapturedRequest> receivedRequest = new CompletableFuture<>();
+    private final AtomicReference<Response> response = new AtomicReference<>(new Response(200, "{}"));
+    private final AtomicReference<CountDownLatch> responseGate = new AtomicReference<>(new CountDownLatch(0));
+    private volatile String expectedAuthorization;
+
+    public FakeOpenAiCompatibleHttpServer() throws IOException {
+        server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
+        server.createContext("/", this::handle);
+        server.start();
+    }
+
+    public URI endpoint(String pathAndQuery) {
+        Objects.requireNonNull(pathAndQuery, "pathAndQuery");
+        if (!pathAndQuery.startsWith("/")) {
+            throw new IllegalArgumentException("pathAndQuery must start with '/'.");
+        }
+        String host = server.getAddress().getAddress().getHostAddress();
+        String uriHost = host.contains(":") ? "[" + host + "]" : host;
+        return URI.create("http://" + uriHost + ":" + server.getAddress().getPort() + pathAndQuery);
+    }
+
+    /** Stores an expected synthetic value without making it observable to tests. */
+    public void expectBearerCredential(String credential) {
+        expectedAuthorization = "Bearer " + Objects.requireNonNull(credential, "credential");
+    }
+
+    public void respondWith(int statusCode, String body) {
+        response.set(new Response(statusCode, Objects.requireNonNull(body, "body")));
+    }
+
+    public void holdResponses() {
+        responseGate.set(new CountDownLatch(1));
+    }
+
+    public void releaseResponses() {
+        responseGate.get().countDown();
+    }
+
+    public CapturedRequest awaitRequest(Duration timeout) {
+        try {
+            return receivedRequest.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while waiting for a loopback request.", failure);
+        } catch (ExecutionException | TimeoutException failure) {
+            throw new IllegalStateException("Loopback request was not received in time.", failure);
+        }
+    }
+
+    public boolean hasReceivedRequest() {
+        return receivedRequest.isDone();
+    }
+
+    private void handle(HttpExchange exchange) throws IOException {
+        String authorization = exchange.getRequestHeaders().getFirst("Authorization");
+        boolean authorizationMatchesExpected = expectedAuthorization != null && expectedAuthorization.equals(authorization);
+        CapturedRequest captured = new CapturedRequest(
+            exchange.getRequestMethod(),
+            exchange.getRequestURI(),
+            exchange.getRequestHeaders().getFirst("Content-Type"),
+            exchange.getRequestHeaders().getFirst("Accept"),
+            authorization != null,
+            authorizationMatchesExpected,
+            new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)
+        );
+        receivedRequest.complete(captured);
+
+        try {
+            responseGate.get().await();
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            exchange.close();
+            return;
+        }
+
+        Response configuredResponse = response.get();
+        byte[] responseBody = configuredResponse.body().getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "application/json");
+        exchange.sendResponseHeaders(configuredResponse.statusCode(), responseBody.length);
+        exchange.getResponseBody().write(responseBody);
+        exchange.close();
+    }
+
+    @Override
+    public void close() {
+        releaseResponses();
+        server.stop(0);
+    }
+
+    /** Safe inspection surface: the authorization value is deliberately omitted. */
+    public record CapturedRequest(
+        String method,
+        URI requestUri,
+        String contentType,
+        String accept,
+        boolean authorizationPresent,
+        boolean authorizationMatchesExpected,
+        String body
+    ) {
+    }
+
+    private record Response(int statusCode, String body) {
+    }
+}

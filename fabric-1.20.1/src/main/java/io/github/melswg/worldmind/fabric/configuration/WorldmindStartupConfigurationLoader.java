@@ -13,6 +13,7 @@ import io.github.melswg.worldmind.core.configuration.GenerationParameters;
 import io.github.melswg.worldmind.core.configuration.IntegrationDisableReason;
 import io.github.melswg.worldmind.core.configuration.LoreMaterial;
 import io.github.melswg.worldmind.core.configuration.ProviderConfiguration;
+import io.github.melswg.worldmind.core.configuration.ProviderEndpoint;
 import io.github.melswg.worldmind.core.configuration.ResponseLengthLimit;
 import io.github.melswg.worldmind.core.configuration.SecretAvailability;
 import io.github.melswg.worldmind.core.configuration.SecretResolver;
@@ -23,6 +24,8 @@ import io.github.melswg.worldmind.core.configuration.WorldmindProfile;
 import java.io.IOException;
 import java.io.Reader;
 import java.math.BigDecimal;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
@@ -44,8 +47,10 @@ public final class WorldmindStartupConfigurationLoader {
     private static final String GLOBAL_FILE_NAME = "worldmind.json";
     private static final String PROFILE_FILE_NAME = "profile.json";
     private static final Pattern PROFILE_ID = Pattern.compile("[a-z0-9][a-z0-9-]{0,63}");
+    private static final Pattern ENV_SECRET_REFERENCE = Pattern.compile("env:[A-Za-z_][A-Za-z0-9_]*");
+    private static final String CUSTOM_OPENAI_COMPATIBLE = "custom-openai-compatible";
     private static final Set<String> GLOBAL_FIELDS = Set.of("schemaVersion", "enabled", "activeProfile", "provider");
-    private static final Set<String> PROVIDER_FIELDS = Set.of("id", "model", "generation", "secretReference");
+    private static final Set<String> PROVIDER_FIELDS = Set.of("id", "endpoint", "model", "generation", "secretReference");
     private static final Set<String> GENERATION_FIELDS = Set.of("temperature", "topP", "maxOutputTokens");
     private static final Set<String> PROFILE_FIELDS = Set.of(
         "schemaVersion",
@@ -91,6 +96,7 @@ public final class WorldmindStartupConfigurationLoader {
             global.activeProfile(),
             new ProviderConfiguration(
                 global.providerId(),
+                global.endpoint(),
                 global.model(),
                 new GenerationParameters(global.temperature(), global.topP(), global.maxOutputTokens()),
                 new ExternalSecretReference(global.secretReference())
@@ -164,8 +170,12 @@ public final class WorldmindStartupConfigurationLoader {
         }
         rejectUnknownFields(provider, "global.provider", PROVIDER_FIELDS, diagnostics);
         String providerId = requiredString(provider, "id", "global.provider", diagnostics);
+        String endpointValue = requiredString(provider, "endpoint", "global.provider", diagnostics);
         String model = requiredString(provider, "model", "global.provider", diagnostics);
         String secretReference = requiredString(provider, "secretReference", "global.provider", diagnostics);
+        ProviderEndpoint endpoint = endpointValue == null ? null : parseProviderEndpoint(endpointValue, diagnostics);
+        validateProviderId(providerId, diagnostics);
+        validateSecretReference(secretReference, diagnostics);
 
         JsonObject generation = requiredObject(provider, "generation", "global.provider", diagnostics);
         if (generation == null) {
@@ -182,8 +192,8 @@ public final class WorldmindStartupConfigurationLoader {
         );
         validateGenerationParameters(temperature, topP, maxOutputTokens, diagnostics);
 
-        if (schemaVersion == null || enabled == null || activeProfile == null || providerId == null || model == null
-            || secretReference == null) {
+        if (schemaVersion == null || enabled == null || activeProfile == null || providerId == null || endpoint == null
+            || model == null || secretReference == null) {
             return null;
         }
         return new ParsedGlobal(
@@ -191,12 +201,91 @@ public final class WorldmindStartupConfigurationLoader {
             enabled,
             activeProfile,
             providerId,
+            endpoint,
             model,
             temperature,
             topP,
             maxOutputTokens,
             secretReference
         );
+    }
+
+    private ProviderEndpoint parseProviderEndpoint(String endpointValue, List<ConfigurationDiagnostic> diagnostics) {
+        URI endpoint;
+        try {
+            endpoint = new URI(endpointValue);
+        } catch (URISyntaxException failure) {
+            diagnostic(diagnostics, "global.provider.endpoint", "must be a valid absolute HTTPS or loopback HTTP URI.");
+            return null;
+        }
+        if (!endpoint.isAbsolute() || endpoint.getHost() == null) {
+            diagnostic(diagnostics, "global.provider.endpoint", "must be an absolute URI with a host.");
+            return null;
+        }
+        if (endpoint.getRawUserInfo() != null) {
+            diagnostic(diagnostics, "global.provider.endpoint", "must not contain user-info.");
+            return null;
+        }
+        if (endpoint.getRawFragment() != null) {
+            diagnostic(diagnostics, "global.provider.endpoint", "must not contain a fragment.");
+            return null;
+        }
+
+        String scheme = endpoint.getScheme();
+        if ("https".equalsIgnoreCase(scheme)) {
+            return new ProviderEndpoint(endpoint);
+        }
+        if ("http".equalsIgnoreCase(scheme) && isSyntacticLoopbackHost(endpoint.getHost())) {
+            return new ProviderEndpoint(endpoint);
+        }
+        diagnostic(
+            diagnostics,
+            "global.provider.endpoint",
+            "must use HTTPS, or HTTP only with localhost, IPv4 loopback, or ::1."
+        );
+        return null;
+    }
+
+    private void validateProviderId(String providerId, List<ConfigurationDiagnostic> diagnostics) {
+        if (providerId != null && !CUSTOM_OPENAI_COMPATIBLE.equals(providerId)) {
+            diagnostic(
+                diagnostics,
+                "global.provider.id",
+                "must be \"" + CUSTOM_OPENAI_COMPATIBLE + "\" in v1."
+            );
+        }
+    }
+
+    private void validateSecretReference(String secretReference, List<ConfigurationDiagnostic> diagnostics) {
+        if (secretReference != null && !ENV_SECRET_REFERENCE.matcher(secretReference).matches()) {
+            diagnostic(
+                diagnostics,
+                "global.provider.secretReference",
+                "must use the env:NAME reference format."
+            );
+        }
+    }
+
+    private boolean isSyntacticLoopbackHost(String host) {
+        String normalized = host.startsWith("[") && host.endsWith("]") ? host.substring(1, host.length() - 1) : host;
+        if ("localhost".equalsIgnoreCase(normalized) || "::1".equals(normalized)) {
+            return true;
+        }
+        String[] octets = normalized.split("\\.", -1);
+        if (octets.length != 4 || !"127".equals(octets[0])) {
+            return false;
+        }
+        for (String octet : octets) {
+            try {
+                int value = Integer.parseInt(octet);
+                if (value < 0 || value > 255) {
+                    return false;
+                }
+            } catch (NumberFormatException failure) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private ParsedProfile parseProfile(Path profileDirectory, List<ConfigurationDiagnostic> diagnostics) {
@@ -561,6 +650,7 @@ public final class WorldmindStartupConfigurationLoader {
         boolean enabled,
         String activeProfile,
         String providerId,
+        ProviderEndpoint endpoint,
         String model,
         Optional<Double> temperature,
         Optional<Double> topP,

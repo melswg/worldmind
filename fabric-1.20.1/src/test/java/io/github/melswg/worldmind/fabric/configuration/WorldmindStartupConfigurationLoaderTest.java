@@ -36,10 +36,10 @@ class WorldmindStartupConfigurationLoaderTest {
             secretResolver
         );
 
-        writeGlobal(true, "oracle", "{\"temperature\": 0.4, \"maxOutputTokens\": 120}", "server-managed-reference");
+        writeGlobal(true, "oracle", "{\"temperature\": 0.4, \"maxOutputTokens\": 120}", "env:WORLDMIND_TEST_KEY");
         EnabledWorldmindIntegration oracle = assertInstanceOf(EnabledWorldmindIntegration.class, loader.load());
 
-        writeGlobal(true, "ranger", "{\"topP\": 0.8, \"maxOutputTokens\": 80}", "server-managed-reference");
+        writeGlobal(true, "ranger", "{\"topP\": 0.8, \"maxOutputTokens\": 80}", "env:WORLDMIND_TEST_KEY");
         EnabledWorldmindIntegration ranger = assertInstanceOf(EnabledWorldmindIntegration.class, loader.load());
 
         assertEquals("Aster", oracle.configuration().profile().characterName());
@@ -51,7 +51,11 @@ class WorldmindStartupConfigurationLoaderTest {
         assertEquals("Bramble", ranger.configuration().profile().characterName());
         assertEquals("Use short field notes.", ranger.configuration().profile().responseStyle());
         assertEquals(160, ranger.configuration().profile().responseLengthLimit().maxCharacters());
-        assertEquals("server-managed-reference", ranger.configuration().globalConfiguration().provider().secretReference().reference());
+        assertEquals("env:WORLDMIND_TEST_KEY", ranger.configuration().globalConfiguration().provider().secretReference().reference());
+        assertEquals(
+            "https://api.example.invalid/v1/chat/completions",
+            ranger.configuration().globalConfiguration().provider().endpoint().uri().toString()
+        );
         assertEquals(2, secretResolver.resolutionCount());
 
         String profileJson = Files.readString(profileDirectory("oracle").resolve("profile.json"), StandardCharsets.UTF_8);
@@ -69,8 +73,9 @@ class WorldmindStartupConfigurationLoaderTest {
               "unsupportedFutureField": true,
               "provider": {
                 "id": "custom-openai-compatible",
+                "endpoint": "https://api.example.invalid/v1/chat/completions",
                 "model": "example-model",
-                "secretReference": "server-managed-reference",
+                "secretReference": "env:WORLDMIND_TEST_KEY",
                 "unsupportedProviderField": true,
                 "generation": {"temperature": 0.4, "topP": 0.8}
               }
@@ -99,7 +104,7 @@ class WorldmindStartupConfigurationLoaderTest {
     @Test
     void refusesAnUnrecognizedSchemaVersionWithoutGuessingAMigration() throws IOException {
         writeProfile("oracle", "Aster", "Measured and curious.", "Never claim server authority.", "Speak calmly.", 280);
-        writeGlobal(true, "oracle", "{}", "server-managed-reference");
+        writeGlobal(true, "oracle", "{}", "env:WORLDMIND_TEST_KEY");
         Path globalFile = configurationDirectory.resolve("worldmind.json");
         String unsupportedVersion = Files.readString(globalFile, StandardCharsets.UTF_8)
             .replace("\"schemaVersion\": 1", "\"schemaVersion\": 0");
@@ -117,7 +122,7 @@ class WorldmindStartupConfigurationLoaderTest {
 
     @Test
     void reportsEveryInvalidProfileFieldWithAHumanReadableReason() throws IOException {
-        writeGlobal(true, "oracle", "{}", "server-managed-reference");
+        writeGlobal(true, "oracle", "{}", "env:WORLDMIND_TEST_KEY");
         Path profile = profileDirectory("oracle");
         Files.createDirectories(profile.resolve("lore"));
         Files.writeString(profile.resolve("persona.md"), "A calm guide.", StandardCharsets.UTF_8);
@@ -149,7 +154,7 @@ class WorldmindStartupConfigurationLoaderTest {
     @Test
     void keepsMinecraftRunningInADiagnosableDisabledStateWhenSecretMaterialIsMissingOrUnreadable() throws IOException {
         writeProfile("oracle", "Aster", "Measured and curious.", "Never claim server authority.", "Speak calmly.", 280);
-        writeGlobal(true, "oracle", "{}", "server-managed-reference");
+        writeGlobal(true, "oracle", "{}", "env:WORLDMIND_TEST_KEY");
         FakeSecretResolver secretResolver = WorldmindTestkit.secretResolver();
         WorldmindStartupConfigurationLoader loader = new WorldmindStartupConfigurationLoader(
             configurationDirectory,
@@ -172,7 +177,7 @@ class WorldmindStartupConfigurationLoaderTest {
     @Test
     void respectsOperatorDisableWithoutResolvingExternalSecretMaterial() throws IOException {
         writeProfile("oracle", "Aster", "Measured and curious.", "Never claim server authority.", "Speak calmly.", 280);
-        writeGlobal(false, "oracle", "{}", "server-managed-reference");
+        writeGlobal(false, "oracle", "{}", "env:WORLDMIND_TEST_KEY");
         FakeSecretResolver secretResolver = WorldmindTestkit.secretResolver();
 
         WorldmindIntegrationState state = new WorldmindStartupConfigurationLoader(
@@ -186,10 +191,100 @@ class WorldmindStartupConfigurationLoaderTest {
         assertEquals(0, secretResolver.resolutionCount());
     }
 
+    @Test
+    void validatesCustomEndpointProviderAndEnvironmentReferenceBeforeSecretResolution() throws IOException {
+        writeProfile("oracle", "Aster", "Measured and curious.", "Never claim server authority.", "Speak calmly.", 280);
+        FakeSecretResolver secrets = WorldmindTestkit.secretResolver();
+        WorldmindStartupConfigurationLoader loader = new WorldmindStartupConfigurationLoader(configurationDirectory, secrets);
+
+        writeGlobal(
+            true,
+            "oracle",
+            "{}",
+            "custom-openai-compatible",
+            "http://127.0.0.1:8090/v1/chat/completions?local=true",
+            "env:WORLDMIND_TEST_KEY"
+        );
+        assertInstanceOf(EnabledWorldmindIntegration.class, loader.load());
+
+        writeGlobal(
+            true,
+            "oracle",
+            "{}",
+            "custom-openai-compatible",
+            "http://[::1]:8090/v1/chat/completions",
+            "env:WORLDMIND_TEST_KEY"
+        );
+        assertInstanceOf(EnabledWorldmindIntegration.class, loader.load());
+
+        writeGlobal(
+            true,
+            "oracle",
+            "{}",
+            "custom-openai-compatible",
+            "http://provider.example/v1/chat/completions",
+            "env:WORLDMIND_TEST_KEY"
+        );
+        DisabledWorldmindIntegration remoteHttp = assertInstanceOf(DisabledWorldmindIntegration.class, loader.load());
+        assertDiagnostic(remoteHttp.diagnostics(), "global.provider.endpoint", "must use HTTPS");
+
+        writeGlobal(
+            true,
+            "oracle",
+            "{}",
+            "custom-openai-compatible",
+            "https://operator@provider.example/v1/chat/completions#fragment",
+            "env:WORLDMIND_TEST_KEY"
+        );
+        DisabledWorldmindIntegration credentialBearingEndpoint = assertInstanceOf(
+            DisabledWorldmindIntegration.class,
+            loader.load()
+        );
+        assertDiagnostic(credentialBearingEndpoint.diagnostics(), "global.provider.endpoint", "must not contain user-info");
+
+        writeGlobal(
+            true,
+            "oracle",
+            "{}",
+            "another-provider",
+            "https://provider.example/v1/chat/completions",
+            "plain-text-reference"
+        );
+        DisabledWorldmindIntegration unsupported = assertInstanceOf(DisabledWorldmindIntegration.class, loader.load());
+        assertDiagnostic(unsupported.diagnostics(), "global.provider.id", "custom-openai-compatible");
+        assertDiagnostic(unsupported.diagnostics(), "global.provider.secretReference", "env:NAME");
+        assertEquals(2, secrets.resolutionCount());
+
+        String missingEndpoint = Files.readString(configurationDirectory.resolve("worldmind.json"), StandardCharsets.UTF_8)
+            .replace("\"endpoint\": \"https://provider.example/v1/chat/completions\",\n", "");
+        Files.writeString(configurationDirectory.resolve("worldmind.json"), missingEndpoint, StandardCharsets.UTF_8);
+        DisabledWorldmindIntegration missing = assertInstanceOf(DisabledWorldmindIntegration.class, loader.load());
+        assertDiagnostic(missing.diagnostics(), "global.provider.endpoint", "is required");
+        assertEquals(missingEndpoint, Files.readString(configurationDirectory.resolve("worldmind.json"), StandardCharsets.UTF_8));
+    }
+
     private void writeGlobal(
         boolean enabled,
         String activeProfile,
         String generation,
+        String secretReference
+    ) throws IOException {
+        writeGlobal(
+            enabled,
+            activeProfile,
+            generation,
+            "custom-openai-compatible",
+            "https://api.example.invalid/v1/chat/completions",
+            secretReference
+        );
+    }
+
+    private void writeGlobal(
+        boolean enabled,
+        String activeProfile,
+        String generation,
+        String providerId,
+        String endpoint,
         String secretReference
     ) throws IOException {
         Files.createDirectories(configurationDirectory);
@@ -199,13 +294,14 @@ class WorldmindStartupConfigurationLoaderTest {
               "enabled": %s,
               "activeProfile": "%s",
               "provider": {
-                "id": "custom-openai-compatible",
+                "id": "%s",
+                "endpoint": "%s",
                 "model": "example-model",
                 "secretReference": "%s",
                 "generation": %s
               }
             }
-            """.formatted(enabled, activeProfile, secretReference, generation), StandardCharsets.UTF_8);
+            """.formatted(enabled, activeProfile, providerId, endpoint, secretReference, generation), StandardCharsets.UTF_8);
     }
 
     private void writeProfile(

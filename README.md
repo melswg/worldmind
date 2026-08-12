@@ -6,8 +6,8 @@ character to Minecraft server chat.
 ## Project status
 
 This repository contains the server-first bootstrap, strict v1 profile loading,
-and provider-neutral core conversation assembly. It does not yet implement chat
-delivery, provider HTTP transport, or memory.
+provider-neutral core conversation assembly, and a custom OpenAI-compatible
+Chat Completions transport. It does not yet implement chat delivery or memory.
 
 ## Target platform
 
@@ -42,8 +42,9 @@ file.
   "activeProfile": "oracle",
   "provider": {
     "id": "custom-openai-compatible",
+    "endpoint": "https://provider.example/v1/chat/completions",
     "model": "example-model",
-    "secretReference": "server-managed-reference",
+    "secretReference": "env:WORLDMIND_API_KEY",
     "generation": {"temperature": 0.4, "maxOutputTokens": 120}
   }
 }
@@ -65,9 +66,12 @@ The selected profile contains only portable character material in
 ```
 
 `secretReference` belongs only in the global configuration; portable profiles
-cannot contain it. A missing or unreadable externally managed secret disables
-only the LLM integration and emits field-specific diagnostics; Minecraft keeps
-running. v1 carries no secret value and does not read environment secrets.
+cannot contain it. v1 accepts only `env:NAME`, read from the server process
+environment. A missing or unreadable secret disables only the LLM integration
+and emits field-specific diagnostics; Minecraft keeps running. The profile,
+provider request, diagnostics, and example configuration never contain its
+value. The configured endpoint is the full Chat Completions URI; HTTPS is
+required except for local loopback HTTP used in tests or local development.
 
 ## Build
 
