@@ -5,8 +5,8 @@ character to Minecraft server chat.
 
 ## Project status
 
-This repository currently contains the public project foundation. Minecraft
-mod implementation has not started yet.
+This repository contains the initial server-first multi-module skeleton. It
+does not yet implement chat, configuration, memory, or LLM providers.
 
 ## Target platform
 
@@ -16,6 +16,17 @@ mod implementation has not started yet.
 
 Worldmind is designed to keep its authoritative logic on the logical Minecraft
 server, so the same path can serve dedicated servers and single-player worlds.
+
+## Modules
+
+- `core` — Minecraft-independent authoritative bootstrap and future domain code.
+- `fabric-1.20.1` — Fabric lifecycle adapter and the distributable mod artifact.
+- `testkit` — reserved namespace for deterministic test support.
+
+## Build
+
+Run `./gradlew build` with Java 17. The build runs ordinary core tests and
+server-side Fabric smoke tests; no client-side Worldmind entrypoint is present.
 
 ## License
 

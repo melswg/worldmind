@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "worldmind",
+  "version": "${version}",
+  "name": "Worldmind",
+  "description": "A server-first configurable AI character for Minecraft server chat.",
+  "authors": [
+    "melswg"
+  ],
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "io.github.melswg.worldmind.fabric.WorldmindFabricMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.15.11",
+    "minecraft": "~1.20.1",
+    "java": ">=17",
+    "fabric-lifecycle-events-v1": "*"
+  }
+}

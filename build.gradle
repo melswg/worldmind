@@ -1,0 +1,32 @@
+plugins {
+    id "base"
+    id "fabric-loom" version "${loom_version}" apply false
+}
+
+allprojects {
+    group = "io.github.melswg.worldmind"
+    version = project.mod_version
+
+    repositories {
+        mavenCentral()
+    }
+}
+
+subprojects {
+    plugins.withId("java") {
+        java {
+            toolchain {
+                languageVersion = JavaLanguageVersion.of(17)
+            }
+        }
+
+        tasks.withType(JavaCompile).configureEach {
+            options.release = 17
+            options.encoding = "UTF-8"
+        }
+
+        tasks.withType(Test).configureEach {
+            useJUnitPlatform()
+        }
+    }
+}

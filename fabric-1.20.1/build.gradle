@@ -1,0 +1,35 @@
+plugins {
+    id "fabric-loom"
+}
+
+base {
+    archivesName = "worldmind-fabric-1.20.1"
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${minecraft_version}"
+    mappings "net.fabricmc:yarn:${yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-lifecycle-events-v1:${fabric_lifecycle_events_version}"
+
+    implementation project(":core")
+    include project(":core")
+
+    testImplementation project(":core")
+    testImplementation project(":testkit")
+    testImplementation platform("org.junit:junit-bom:5.10.2")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+
+processResources {
+    inputs.property "version", project.version
+
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+java {
+    withSourcesJar()
+}
