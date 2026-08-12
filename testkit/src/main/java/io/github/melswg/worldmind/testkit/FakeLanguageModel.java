@@ -42,6 +42,16 @@ public final class FakeLanguageModel implements LanguageModel {
         return this;
     }
 
+    public FakeLanguageModel willReturnNoCompletionStage() {
+        scenario = request -> null;
+        return this;
+    }
+
+    public FakeLanguageModel willCompleteWithNoResult() {
+        scenario = request -> CompletableFuture.completedFuture(null);
+        return this;
+    }
+
     public List<ProviderRequest> receivedRequests() {
         return List.copyOf(receivedRequests);
     }

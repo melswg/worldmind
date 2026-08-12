@@ -3,8 +3,11 @@ package io.github.melswg.worldmind.testkit;
 import io.github.melswg.worldmind.core.conversation.ConversationApplicationService;
 import io.github.melswg.worldmind.core.conversation.ConversationOutcome;
 import io.github.melswg.worldmind.core.conversation.NormalizedServerRequest;
+import io.github.melswg.worldmind.core.conversation.ProviderCapabilities;
 import io.github.melswg.worldmind.core.conversation.ServerRequester;
 import io.github.melswg.worldmind.core.conversation.UntrustedContext;
+import io.github.melswg.worldmind.core.conversation.WorldIdentity;
+import io.github.melswg.worldmind.core.configuration.ValidatedWorldmindConfiguration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -41,12 +44,22 @@ public final class WorldmindAcceptanceScenario {
         UUID playerId,
         String playerName,
         String message,
-        SyntheticVanillaGameContext vanillaContext
+        WorldIdentity worldIdentity,
+        SyntheticVanillaGameContext vanillaContext,
+        ValidatedWorldmindConfiguration validatedConfiguration,
+        ProviderCapabilities providerCapabilities
     ) {
         List<UntrustedContext> context = new ArrayList<>();
         if (vanillaContext != null) {
             context.add(vanillaContext.asUntrustedContext());
         }
-        return new NormalizedServerRequest(new ServerRequester(playerId, playerName), message, context);
+        return new NormalizedServerRequest(
+            new ServerRequester(playerId, playerName),
+            worldIdentity,
+            message,
+            context,
+            validatedConfiguration,
+            providerCapabilities
+        );
     }
 }

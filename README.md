@@ -5,9 +5,9 @@ character to Minecraft server chat.
 
 ## Project status
 
-This repository contains the server-first bootstrap and strict v1 profile
-loading. It does not yet implement chat delivery, provider HTTP transport, or
-memory.
+This repository contains the server-first bootstrap, strict v1 profile loading,
+and provider-neutral core conversation assembly. It does not yet implement chat
+delivery, provider HTTP transport, or memory.
 
 ## Target platform
 

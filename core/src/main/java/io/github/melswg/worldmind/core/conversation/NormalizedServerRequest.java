@@ -1,25 +1,28 @@
 package io.github.melswg.worldmind.core.conversation;
 
+import io.github.melswg.worldmind.core.configuration.ValidatedWorldmindConfiguration;
 import java.util.List;
 import java.util.Objects;
 
 /**
- * A request already normalized by the server adapter. It deliberately carries
- * data only; profile loading and production prompt assembly are outside this seam.
+ * A request normalized by the server adapter before core assembles the
+ * provider-neutral conversation from validated configuration and data inputs.
  */
 public record NormalizedServerRequest(
     ServerRequester requester,
+    WorldIdentity worldIdentity,
     String message,
-    List<UntrustedContext> untrustedContext
+    List<UntrustedContext> currentGameContext,
+    ValidatedWorldmindConfiguration validatedConfiguration,
+    ProviderCapabilities providerCapabilities
 ) {
     public NormalizedServerRequest {
         Objects.requireNonNull(requester, "requester");
+        Objects.requireNonNull(worldIdentity, "worldIdentity");
         message = requireText(message, "message");
-        untrustedContext = List.copyOf(Objects.requireNonNull(untrustedContext, "untrustedContext"));
-    }
-
-    public ProviderRequest providerRequest() {
-        return new ProviderRequest(message, untrustedContext);
+        currentGameContext = List.copyOf(Objects.requireNonNull(currentGameContext, "currentGameContext"));
+        Objects.requireNonNull(validatedConfiguration, "validatedConfiguration");
+        Objects.requireNonNull(providerCapabilities, "providerCapabilities");
     }
 
     private static String requireText(String value, String name) {
