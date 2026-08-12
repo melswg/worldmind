@@ -52,6 +52,9 @@ class WorldmindStartupConfigurationLoaderTest {
         assertEquals("Use short field notes.", ranger.configuration().profile().responseStyle());
         assertEquals(160, ranger.configuration().profile().responseLengthLimit().maxCharacters());
         assertEquals("env:WORLDMIND_TEST_KEY", ranger.configuration().globalConfiguration().provider().secretReference().reference());
+        assertEquals(8, ranger.configuration().globalConfiguration().chatBatching().maxMessages());
+        assertEquals(5_000, ranger.configuration().globalConfiguration().chatBatching().maxWaitMillis());
+        assertEquals(4_000, ranger.configuration().globalConfiguration().chatBatching().maxEstimatedInputCharacters());
         assertEquals(
             "https://api.example.invalid/v1/chat/completions",
             ranger.configuration().globalConfiguration().provider().endpoint().uri().toString()
@@ -70,6 +73,7 @@ class WorldmindStartupConfigurationLoaderTest {
               "schemaVersion": 2,
               "enabled": true,
               "activeProfile": "oracle",
+              "chatBatching": {"maxMessages": 8, "maxWaitMillis": 5000, "maxEstimatedInputCharacters": 4000},
               "unsupportedFutureField": true,
               "provider": {
                 "id": "custom-openai-compatible",
@@ -99,6 +103,69 @@ class WorldmindStartupConfigurationLoaderTest {
         );
         assertDiagnostic(disabled.diagnostics(), "global.provider.generation", "temperature and topP cannot both be configured");
         assertEquals(futureGlobal, Files.readString(globalFile, StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void requiresStrictPositiveAndSafelyRepresentableChatBatchingFields() throws IOException {
+        writeProfile("oracle", "Aster", "Measured and curious.", "Never claim server authority.", "Speak calmly.", 280);
+        writeGlobal(true, "oracle", "{}", "env:WORLDMIND_TEST_KEY");
+        Path globalFile = configurationDirectory.resolve("worldmind.json");
+        String invalid = Files.readString(globalFile, StandardCharsets.UTF_8)
+            .replace("\"maxMessages\": 8", "\"maxMessages\": 0")
+            .replace("\"maxWaitMillis\": 5000", "\"maxWaitMillis\": 2147483648")
+            .replace("\"maxEstimatedInputCharacters\": 4000", "\"maxEstimatedInputCharacters\": \"many\", \"unknown\": true");
+        Files.writeString(globalFile, invalid, StandardCharsets.UTF_8);
+
+        DisabledWorldmindIntegration disabled = assertInstanceOf(
+            DisabledWorldmindIntegration.class,
+            new WorldmindStartupConfigurationLoader(configurationDirectory, WorldmindTestkit.secretResolver()).load()
+        );
+
+        assertDiagnostic(disabled.diagnostics(), "global.chatBatching.maxMessages", "positive");
+        assertDiagnostic(disabled.diagnostics(), "global.chatBatching.maxWaitMillis", "integer");
+        assertDiagnostic(disabled.diagnostics(), "global.chatBatching.maxEstimatedInputCharacters", "integer");
+        assertDiagnostic(disabled.diagnostics(), "global.chatBatching.unknown", "not supported by the strict v1 schema");
+        assertEquals(invalid, Files.readString(globalFile, StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void reportsMissingChatBatchingAsAFieldLevelStartupDiagnostic() throws IOException {
+        writeProfile("oracle", "Aster", "Measured and curious.", "Never claim server authority.", "Speak calmly.", 280);
+        writeGlobal(true, "oracle", "{}", "env:WORLDMIND_TEST_KEY");
+        Path globalFile = configurationDirectory.resolve("worldmind.json");
+        String missing = Files.readString(globalFile, StandardCharsets.UTF_8).replaceAll(
+            "(?s)\\s*\\\"chatBatching\\\": \\{.*?\\},(?=\\s*\\\"provider\\\")",
+            ""
+        );
+        Files.writeString(globalFile, missing, StandardCharsets.UTF_8);
+
+        DisabledWorldmindIntegration disabled = assertInstanceOf(
+            DisabledWorldmindIntegration.class,
+            new WorldmindStartupConfigurationLoader(configurationDirectory, WorldmindTestkit.secretResolver()).load()
+        );
+
+        assertDiagnostic(disabled.diagnostics(), "global.chatBatching", "is required");
+    }
+
+    @Test
+    void rejectsZeroAndNegativeChatBatchingValuesWithoutStartingTheIntegration() throws IOException {
+        writeProfile("oracle", "Aster", "Measured and curious.", "Never claim server authority.", "Speak calmly.", 280);
+        writeGlobal(true, "oracle", "{}", "env:WORLDMIND_TEST_KEY");
+        Path globalFile = configurationDirectory.resolve("worldmind.json");
+        String nonPositive = Files.readString(globalFile, StandardCharsets.UTF_8)
+            .replace("\"maxMessages\": 8", "\"maxMessages\": -1")
+            .replace("\"maxWaitMillis\": 5000", "\"maxWaitMillis\": 0")
+            .replace("\"maxEstimatedInputCharacters\": 4000", "\"maxEstimatedInputCharacters\": -1");
+        Files.writeString(globalFile, nonPositive, StandardCharsets.UTF_8);
+
+        DisabledWorldmindIntegration disabled = assertInstanceOf(
+            DisabledWorldmindIntegration.class,
+            new WorldmindStartupConfigurationLoader(configurationDirectory, WorldmindTestkit.secretResolver()).load()
+        );
+
+        assertDiagnostic(disabled.diagnostics(), "global.chatBatching.maxMessages", "positive");
+        assertDiagnostic(disabled.diagnostics(), "global.chatBatching.maxWaitMillis", "positive");
+        assertDiagnostic(disabled.diagnostics(), "global.chatBatching.maxEstimatedInputCharacters", "positive");
     }
 
     @Test
@@ -293,6 +360,11 @@ class WorldmindStartupConfigurationLoaderTest {
               "schemaVersion": 1,
               "enabled": %s,
               "activeProfile": "%s",
+              "chatBatching": {
+                "maxMessages": 8,
+                "maxWaitMillis": 5000,
+                "maxEstimatedInputCharacters": 4000
+              },
               "provider": {
                 "id": "%s",
                 "endpoint": "%s",

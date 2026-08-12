@@ -6,8 +6,10 @@ character to Minecraft server chat.
 ## Project status
 
 This repository contains the server-first bootstrap, strict v1 profile loading,
-provider-neutral core conversation assembly, and a custom OpenAI-compatible
-Chat Completions transport. It does not yet implement chat delivery or memory.
+provider-neutral core conversation assembly, a custom OpenAI-compatible Chat
+Completions transport, and bounded observation of accepted public server chat.
+It does not yet decide participation, deliver chat responses, or implement
+memory.
 
 ## Target platform
 
@@ -20,11 +22,12 @@ server, so the same path can serve dedicated servers and single-player worlds.
 
 ## Modules
 
-- `core` — Minecraft-independent authoritative bootstrap and future domain code.
+- `core` — Minecraft-independent authoritative bootstrap, public-chat batching,
+  and future domain code.
 - `fabric-1.20.1` — Fabric lifecycle adapter and the distributable mod artifact.
 - `testkit` — deterministic acceptance seam with a fake LLM, controlled clock,
   controllable server scheduler, and synthetic vanilla game context. It records
-  stable provider requests without HTTP, JSON, or a Minecraft client.
+  stable provider requests and sealed chat batches without a Minecraft client.
 
 ## Configuration v1
 
@@ -40,6 +43,11 @@ file.
   "schemaVersion": 1,
   "enabled": true,
   "activeProfile": "oracle",
+  "chatBatching": {
+    "maxMessages": 8,
+    "maxWaitMillis": 5000,
+    "maxEstimatedInputCharacters": 4000
+  },
   "provider": {
     "id": "custom-openai-compatible",
     "endpoint": "https://provider.example/v1/chat/completions",
@@ -49,6 +57,11 @@ file.
   }
 }
 ```
+
+`chatBatching` is required in v1. It bounds a per-save public-chat batch by
+message count, elapsed time from its first message, and a stable early Unicode
+character estimate. Reaching a limit includes the triggering message and
+seals the batch; it does not impose a reply quota.
 
 The selected profile contains only portable character material in
 `profile.json`, plus the referenced Markdown files:

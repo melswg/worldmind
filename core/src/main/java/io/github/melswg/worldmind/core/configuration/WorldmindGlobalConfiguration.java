@@ -7,7 +7,8 @@ public record WorldmindGlobalConfiguration(
     int schemaVersion,
     boolean enabled,
     String activeProfile,
-    ProviderConfiguration provider
+    ProviderConfiguration provider,
+    ChatBatchingConfiguration chatBatching
 ) {
     public static final int V1_SCHEMA_VERSION = 1;
 
@@ -20,5 +21,6 @@ public record WorldmindGlobalConfiguration(
             throw new IllegalArgumentException("activeProfile must not be blank.");
         }
         Objects.requireNonNull(provider, "provider");
+        Objects.requireNonNull(chatBatching, "chatBatching");
     }
 }

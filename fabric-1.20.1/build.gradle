@@ -11,6 +11,7 @@ dependencies {
     mappings "net.fabricmc:yarn:${yarn_mappings}:v2"
     modImplementation "net.fabricmc:fabric-loader:${loader_version}"
     modImplementation "net.fabricmc.fabric-api:fabric-lifecycle-events-v1:${fabric_lifecycle_events_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-message-api-v1:${fabric_message_api_version}"
 
     implementation project(":core")
     include project(":core")

@@ -6,6 +6,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.JsonParseException;
 import io.github.melswg.worldmind.core.configuration.ConfigurationDiagnostic;
+import io.github.melswg.worldmind.core.configuration.ChatBatchingConfiguration;
 import io.github.melswg.worldmind.core.configuration.DisabledWorldmindIntegration;
 import io.github.melswg.worldmind.core.configuration.EnabledWorldmindIntegration;
 import io.github.melswg.worldmind.core.configuration.ExternalSecretReference;
@@ -49,7 +50,18 @@ public final class WorldmindStartupConfigurationLoader {
     private static final Pattern PROFILE_ID = Pattern.compile("[a-z0-9][a-z0-9-]{0,63}");
     private static final Pattern ENV_SECRET_REFERENCE = Pattern.compile("env:[A-Za-z_][A-Za-z0-9_]*");
     private static final String CUSTOM_OPENAI_COMPATIBLE = "custom-openai-compatible";
-    private static final Set<String> GLOBAL_FIELDS = Set.of("schemaVersion", "enabled", "activeProfile", "provider");
+    private static final Set<String> GLOBAL_FIELDS = Set.of(
+        "schemaVersion",
+        "enabled",
+        "activeProfile",
+        "provider",
+        "chatBatching"
+    );
+    private static final Set<String> CHAT_BATCHING_FIELDS = Set.of(
+        "maxMessages",
+        "maxWaitMillis",
+        "maxEstimatedInputCharacters"
+    );
     private static final Set<String> PROVIDER_FIELDS = Set.of("id", "endpoint", "model", "generation", "secretReference");
     private static final Set<String> GENERATION_FIELDS = Set.of("temperature", "topP", "maxOutputTokens");
     private static final Set<String> PROFILE_FIELDS = Set.of(
@@ -100,7 +112,8 @@ public final class WorldmindStartupConfigurationLoader {
                 global.model(),
                 new GenerationParameters(global.temperature(), global.topP(), global.maxOutputTokens()),
                 new ExternalSecretReference(global.secretReference())
-            )
+            ),
+            global.chatBatching()
         );
         WorldmindProfile worldmindProfile = new WorldmindProfile(
             profile.schemaVersion(),
@@ -163,6 +176,8 @@ public final class WorldmindStartupConfigurationLoader {
         }
         Boolean enabled = requiredBoolean(global, "enabled", "global", diagnostics);
         String activeProfile = requiredString(global, "activeProfile", "global", diagnostics);
+        JsonObject chatBatching = requiredObject(global, "chatBatching", "global", diagnostics);
+        ChatBatchingConfiguration batchingConfiguration = parseChatBatching(chatBatching, diagnostics);
 
         JsonObject provider = requiredObject(global, "provider", "global", diagnostics);
         if (provider == null) {
@@ -192,8 +207,8 @@ public final class WorldmindStartupConfigurationLoader {
         );
         validateGenerationParameters(temperature, topP, maxOutputTokens, diagnostics);
 
-        if (schemaVersion == null || enabled == null || activeProfile == null || providerId == null || endpoint == null
-            || model == null || secretReference == null) {
+        if (schemaVersion == null || enabled == null || activeProfile == null || batchingConfiguration == null
+            || providerId == null || endpoint == null || model == null || secretReference == null) {
             return null;
         }
         return new ParsedGlobal(
@@ -206,8 +221,49 @@ public final class WorldmindStartupConfigurationLoader {
             temperature,
             topP,
             maxOutputTokens,
-            secretReference
+            secretReference,
+            batchingConfiguration
         );
+    }
+
+    private ChatBatchingConfiguration parseChatBatching(
+        JsonObject chatBatching,
+        List<ConfigurationDiagnostic> diagnostics
+    ) {
+        if (chatBatching == null) {
+            return null;
+        }
+        rejectUnknownFields(chatBatching, "global.chatBatching", CHAT_BATCHING_FIELDS, diagnostics);
+        Integer maxMessages = requiredInteger(chatBatching, "maxMessages", "global.chatBatching", diagnostics);
+        Integer maxWaitMillis = requiredInteger(chatBatching, "maxWaitMillis", "global.chatBatching", diagnostics);
+        Integer maxEstimatedInputCharacters = requiredInteger(
+            chatBatching,
+            "maxEstimatedInputCharacters",
+            "global.chatBatching",
+            diagnostics
+        );
+        validatePositiveBatchingValue(maxMessages, "global.chatBatching.maxMessages", diagnostics);
+        validatePositiveBatchingValue(maxWaitMillis, "global.chatBatching.maxWaitMillis", diagnostics);
+        validatePositiveBatchingValue(
+            maxEstimatedInputCharacters,
+            "global.chatBatching.maxEstimatedInputCharacters",
+            diagnostics
+        );
+        if (maxMessages == null || maxWaitMillis == null || maxEstimatedInputCharacters == null
+            || maxMessages <= 0 || maxWaitMillis <= 0 || maxEstimatedInputCharacters <= 0) {
+            return null;
+        }
+        return new ChatBatchingConfiguration(maxMessages, maxWaitMillis, maxEstimatedInputCharacters);
+    }
+
+    private void validatePositiveBatchingValue(
+        Integer value,
+        String field,
+        List<ConfigurationDiagnostic> diagnostics
+    ) {
+        if (value != null && value <= 0) {
+            diagnostic(diagnostics, field, "must be a positive, safely representable integer.");
+        }
     }
 
     private ProviderEndpoint parseProviderEndpoint(String endpointValue, List<ConfigurationDiagnostic> diagnostics) {
@@ -655,7 +711,8 @@ public final class WorldmindStartupConfigurationLoader {
         Optional<Double> temperature,
         Optional<Double> topP,
         Optional<Integer> maxOutputTokens,
-        String secretReference
+        String secretReference,
+        ChatBatchingConfiguration chatBatching
     ) {
     }
 

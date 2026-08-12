@@ -9,6 +9,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import io.github.melswg.worldmind.core.configuration.ExternalSecretReference;
+import io.github.melswg.worldmind.core.configuration.ChatBatchingConfiguration;
 import io.github.melswg.worldmind.core.configuration.GenerationParameters;
 import io.github.melswg.worldmind.core.configuration.LoreMaterial;
 import io.github.melswg.worldmind.core.configuration.ProviderConfiguration;
@@ -238,7 +239,8 @@ class CustomOpenAiCompatibleLanguageModelTest {
                 WorldmindGlobalConfiguration.V1_SCHEMA_VERSION,
                 true,
                 "transport-profile",
-                provider
+                provider,
+                new ChatBatchingConfiguration(8, 5_000, 4_000)
             ),
             new WorldmindProfile(
                 WorldmindProfile.V1_SCHEMA_VERSION,

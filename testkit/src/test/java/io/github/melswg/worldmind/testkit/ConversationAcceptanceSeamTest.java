@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.melswg.worldmind.core.configuration.ExternalSecretReference;
+import io.github.melswg.worldmind.core.configuration.ChatBatchingConfiguration;
 import io.github.melswg.worldmind.core.configuration.GenerationParameters;
 import io.github.melswg.worldmind.core.configuration.LoreMaterial;
 import io.github.melswg.worldmind.core.configuration.ProviderConfiguration;
@@ -301,7 +302,8 @@ class ConversationAcceptanceSeamTest {
                     "example-model",
                     new GenerationParameters(Optional.of(0.4), Optional.empty(), Optional.of(120)),
                     new ExternalSecretReference("env:WORLDMIND_ACCEPTANCE_KEY")
-                )
+                ),
+                new ChatBatchingConfiguration(8, 5_000, 4_000)
             ),
             profile
         );

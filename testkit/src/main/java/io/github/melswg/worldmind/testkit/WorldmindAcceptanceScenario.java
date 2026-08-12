@@ -2,13 +2,16 @@ package io.github.melswg.worldmind.testkit;
 
 import io.github.melswg.worldmind.core.conversation.ConversationApplicationService;
 import io.github.melswg.worldmind.core.conversation.ConversationOutcome;
+import io.github.melswg.worldmind.core.conversation.ChatBatchCoordinator;
 import io.github.melswg.worldmind.core.conversation.LanguageModel;
 import io.github.melswg.worldmind.core.conversation.NormalizedServerRequest;
 import io.github.melswg.worldmind.core.conversation.ProviderCapabilities;
 import io.github.melswg.worldmind.core.conversation.ServerRequester;
+import io.github.melswg.worldmind.core.conversation.SealedChatBatchConsumer;
 import io.github.melswg.worldmind.core.conversation.UntrustedContext;
 import io.github.melswg.worldmind.core.conversation.WorldIdentity;
 import io.github.melswg.worldmind.core.configuration.ValidatedWorldmindConfiguration;
+import io.github.melswg.worldmind.core.configuration.ChatBatchingConfiguration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -20,8 +23,8 @@ import java.util.concurrent.CompletionStage;
  */
 public final class WorldmindAcceptanceScenario {
     private final LanguageModel languageModel;
-    private final DeterministicScheduler serverScheduler = new DeterministicScheduler();
     private final ControlledClock clock = ControlledClock.startingAt(Instant.EPOCH);
+    private final DeterministicScheduler serverScheduler = new DeterministicScheduler(clock);
     private final ConversationApplicationService applicationService;
 
     public WorldmindAcceptanceScenario() {
@@ -50,6 +53,15 @@ public final class WorldmindAcceptanceScenario {
 
     public CompletionStage<ConversationOutcome> submit(NormalizedServerRequest request) {
         return applicationService.handle(request);
+    }
+
+    /** Creates the Ticket 07 batch boundary without invoking the scenario LLM. */
+    public ChatBatchCoordinator chatBatcher(
+        ChatBatchingConfiguration configuration,
+        String characterName,
+        SealedChatBatchConsumer consumer
+    ) {
+        return new ChatBatchCoordinator(configuration, characterName, clock, serverScheduler, consumer);
     }
 
     public NormalizedServerRequest normalizedRequest(
