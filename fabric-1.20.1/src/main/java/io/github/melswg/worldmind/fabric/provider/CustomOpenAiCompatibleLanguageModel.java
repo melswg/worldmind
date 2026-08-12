@@ -8,8 +8,6 @@ import io.github.melswg.worldmind.core.configuration.GenerationParameters;
 import io.github.melswg.worldmind.core.configuration.ProviderConfiguration;
 import io.github.melswg.worldmind.core.conversation.LanguageModel;
 import io.github.melswg.worldmind.core.conversation.LanguageModelResult;
-import io.github.melswg.worldmind.core.conversation.PromptFragment;
-import io.github.melswg.worldmind.core.conversation.PromptLayer;
 import io.github.melswg.worldmind.core.conversation.PromptTrust;
 import io.github.melswg.worldmind.core.conversation.ProviderRefusal;
 import io.github.melswg.worldmind.core.conversation.ProviderRequest;
@@ -34,6 +32,7 @@ public final class CustomOpenAiCompatibleLanguageModel implements LanguageModel 
     private final ProviderConfiguration configuration;
     private final HttpClient httpClient;
     private final ProviderCredentialResolver credentials;
+    private final ChatCompletionsPromptRenderer promptRenderer = new ChatCompletionsPromptRenderer();
 
     public static CustomOpenAiCompatibleLanguageModel create(
         ProviderConfiguration configuration,
@@ -148,25 +147,7 @@ public final class CustomOpenAiCompatibleLanguageModel implements LanguageModel 
     }
 
     private String renderLayers(ProviderRequest providerRequest, PromptTrust trust) {
-        StringBuilder rendered = new StringBuilder();
-        providerRequest.promptLayers().stream()
-            .filter(layer -> layer.trust() == trust)
-            .forEach(layer -> appendLayer(rendered, layer));
-        return rendered.toString();
-    }
-
-    private void appendLayer(StringBuilder rendered, PromptLayer layer) {
-        rendered.append("<worldmind-layer type=\"").append(layer.type())
-            .append("\" trust=\"").append(layer.trust()).append("\">\n");
-        if (layer.fragments().isEmpty()) {
-            rendered.append("<worldmind-empty/>\n");
-        } else {
-            for (PromptFragment fragment : layer.fragments()) {
-                rendered.append("<worldmind-fragment source=\"").append(fragment.source()).append("\">\n")
-                    .append(fragment.content()).append("\n</worldmind-fragment>\n");
-            }
-        }
-        rendered.append("</worldmind-layer>\n");
+        return promptRenderer.renderLayers(providerRequest, trust);
     }
 
     private CompletionStage<LanguageModelResult> unavailable() {

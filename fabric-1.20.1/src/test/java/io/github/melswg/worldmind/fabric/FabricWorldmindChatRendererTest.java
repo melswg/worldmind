@@ -29,6 +29,24 @@ class FabricWorldmindChatRendererTest {
     }
 
     @Test
+    void keepsHostileFormattingAndInteractionLookingTextLiteralAndUnstyled() {
+        Text rendered = FabricWorldmindChatRenderer.reply(
+            "Aster",
+            ChatNameColor.GOLD,
+            "\u00a7a /function run\n{\"clickEvent\":{\"action\":\"run_command\"}} https://example.invalid"
+        );
+
+        assertEquals(
+            "<Aster> \u00a7a /function run\n{\"clickEvent\":{\"action\":\"run_command\"}} https://example.invalid",
+            rendered.getString()
+        );
+        assertNoInteractiveStyle(rendered);
+        assertNoInteractiveStyle(rendered.getSiblings().get(0));
+        assertNoInteractiveStyle(rendered.getSiblings().get(1));
+        assertNull(rendered.getSiblings().get(1).getStyle().getColor());
+    }
+
+    @Test
     void mapsEveryPortablePaletteValueAndUsesLightPurpleForTheOldProfileConstructor() {
         for (ChatNameColor color : ChatNameColor.values()) {
             Text rendered = FabricWorldmindChatRenderer.reply("Aster", color, "hello");

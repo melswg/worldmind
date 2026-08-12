@@ -7,10 +7,10 @@ character to Minecraft server chat.
 
 This repository contains the server-first bootstrap, strict v1 profile loading,
 provider-neutral core conversation assembly, a custom OpenAI-compatible Chat
-Completions transport, bounded observation of accepted public server chat, and
-typed participation decisions and selective server-chat delivery for sealed
-chat batches. It does not yet implement memory or provide Ticket 10 prompt
-budgeting and hostile-input/output hardening.
+Completions transport, bounded observation of accepted public server chat,
+typed participation decisions, prompt safety limits, and selective literal
+server-chat delivery for sealed chat batches. It does not yet implement
+long-term memory.
 
 ## Target platform
 
@@ -93,6 +93,31 @@ and emits field-specific diagnostics; Minecraft keeps running. The profile,
 provider request, diagnostics, and example configuration never contain its
 value. The configured endpoint is the full Chat Completions URI; HTTPS is
 required except for local loopback HTTP used in tests or local development.
+
+## Prompt and chat safety
+
+The provider-visible conversation always has this fixed order: built-in safety
+policy and participation protocol, administrator rules, persona, lore, memory,
+current game context, then the current public-chat batch. Lore, memory, game
+context, and every player message remain source-attributed untrusted data;
+they cannot create another prompt layer, system message, tool call, or chat
+delivery path.
+
+v1 uses documented internal, provider-neutral Unicode code-point estimates:
+12,000 for total input, 2,400 per untrusted layer, and 900 per serialized chat
+fragment. They are not token counts and are intentionally not configuration
+fields. When input is excessive, future memory, lore, game context, and then
+older chat data are removed first. The newest triggering chat fragment keeps
+its stable source attribution and carries a truncation marker when shortened.
+If the mandatory trusted prompt cannot fit, Worldmind makes no provider request
+and returns a controlled failure to the existing delivery path.
+
+Provider output is decoded once by the participation protocol. Reply text is
+then normalized, stripped of formatting/control and directional characters, and
+limited by the configured `responseLengthLimit` using Unicode code points. The
+Fabric adapter always constructs literal components, so command-looking text,
+URLs, JSON, or click-event-looking output has no executable or interactive
+meaning. No configuration changes are needed for these safety boundaries.
 
 ## Build
 

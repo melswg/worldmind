@@ -2,6 +2,7 @@ package io.github.melswg.worldmind.fabric;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.melswg.worldmind.core.configuration.ChatBatchingConfiguration;
@@ -99,6 +100,52 @@ class FabricChatObservationRuntimeTest {
         assertFalse(sink.broadcasts.isEmpty());
     }
 
+    @Test
+    void sendsSanitizedProviderOutputOnlyAsAPlainNonInteractiveLiteralComponent() {
+        WorldmindAcceptanceScenario scenario = WorldmindTestkit.scenario();
+        scenario.languageModel().willRespondWith(
+            "DIRECT_REPLY\n\u00a7a /function run {\"clickEvent\":{\"action\":\"run_command\"}}\u202e"
+        );
+        RecordingSink sink = new RecordingSink();
+        FabricChatObservationRuntime runtime = runtime(scenario, sink);
+
+        runtime.observeCapturedPublicChat(captured("Aster!", AddressingSignal.EXACT), WORLD);
+        scenario.serverScheduler().runUntilIdle();
+
+        Text rendered = sink.broadcasts.get(0);
+        assertEquals("<Aster> /function run {\"clickEvent\":{\"action\":\"run_command\"}}", rendered.getString());
+        assertNoInteractiveStyle(rendered);
+        assertNoInteractiveStyle(rendered.getSiblings().get(0));
+        assertNoInteractiveStyle(rendered.getSiblings().get(1));
+        assertNull(rendered.getSiblings().get(1).getStyle().getColor());
+    }
+
+    @Test
+    void mapsOutputSafetyRefusalsToOnePrivateExactFailureAndAmbientSilence() {
+        WorldmindAcceptanceScenario exactScenario = WorldmindTestkit.scenario();
+        exactScenario.languageModel().willRespondWith("DIRECT_REPLY\n\u00a7a\u202e\u0007");
+        RecordingSink exactSink = new RecordingSink();
+        FabricChatObservationRuntime exactRuntime = runtime(exactScenario, exactSink);
+
+        exactRuntime.observeCapturedPublicChat(captured("Aster!", AddressingSignal.EXACT), WORLD);
+        exactScenario.serverScheduler().runUntilIdle();
+
+        assertTrue(exactSink.broadcasts.isEmpty());
+        assertEquals(1, exactSink.privateMessages.size());
+        assertEquals("<Aster> I can't answer right now.", exactSink.privateMessages.get(0).message().getString());
+
+        WorldmindAcceptanceScenario ambientScenario = WorldmindTestkit.scenario();
+        ambientScenario.languageModel().willRespondWith("AMBIENT_REPLY\n\u00a7a\u202e\u0007");
+        RecordingSink ambientSink = new RecordingSink();
+        FabricChatObservationRuntime ambientRuntime = runtime(ambientScenario, ambientSink);
+
+        ambientRuntime.observeCapturedPublicChat(captured("The rain is loud.", AddressingSignal.NONE), WORLD);
+        ambientScenario.serverScheduler().runUntilIdle();
+
+        assertTrue(ambientSink.broadcasts.isEmpty());
+        assertTrue(ambientSink.privateMessages.isEmpty());
+    }
+
     private FabricChatObservationRuntime runtime(WorldmindAcceptanceScenario scenario, RecordingSink sink) {
         return new FabricChatObservationRuntime(
             WORLD,
@@ -163,5 +210,11 @@ class FabricChatObservationRuntimeTest {
     }
 
     private record PrivateMessage(UUID playerId, Text message) {
+    }
+
+    private void assertNoInteractiveStyle(Text text) {
+        assertNull(text.getStyle().getClickEvent());
+        assertNull(text.getStyle().getHoverEvent());
+        assertNull(text.getStyle().getInsertion());
     }
 }

@@ -1,5 +1,6 @@
 package io.github.melswg.worldmind.core.conversation;
 
+import io.github.melswg.worldmind.core.configuration.ResponseLengthLimit;
 import java.util.Objects;
 
 /**
@@ -29,8 +30,9 @@ final class ParticipationProtocol {
     private ParticipationProtocol() {
     }
 
-    static ConversationOutcome decode(String providerText) {
+    static ConversationOutcome decode(String providerText, ResponseLengthLimit responseLengthLimit) {
         Objects.requireNonNull(providerText, "providerText");
+        Objects.requireNonNull(responseLengthLimit, "responseLengthLimit");
         String normalized = normalize(providerText);
         if (normalized.isEmpty()) {
             return new ConversationRefusal(RefusalCode.EMPTY_RESPONSE);
@@ -42,10 +44,10 @@ final class ParticipationProtocol {
             return new ConversationRefusal(RefusalCode.EMPTY_RESPONSE);
         }
         if (normalized.startsWith(DIRECT_REPLY)) {
-            return reply(normalized, DIRECT_REPLY, DirectReply::new);
+            return reply(normalized, DIRECT_REPLY, responseLengthLimit, DirectReply::new);
         }
         if (normalized.startsWith(AMBIENT_REPLY)) {
-            return reply(normalized, AMBIENT_REPLY, AmbientReply::new);
+            return reply(normalized, AMBIENT_REPLY, responseLengthLimit, AmbientReply::new);
         }
         return invalidResponse();
     }
@@ -53,12 +55,16 @@ final class ParticipationProtocol {
     private static ConversationOutcome reply(
         String normalized,
         String decisionToken,
+        ResponseLengthLimit responseLengthLimit,
         java.util.function.Function<String, ConversationOutcome> outcomeFactory
     ) {
         if (normalized.length() == decisionToken.length() || normalized.charAt(decisionToken.length()) != '\n') {
             return invalidResponse();
         }
-        String body = normalized.substring(decisionToken.length() + 1).strip();
+        String body = ReplyBodySanitizer.sanitize(
+            normalized.substring(decisionToken.length() + 1),
+            responseLengthLimit
+        );
         return body.isEmpty() ? new ConversationRefusal(RefusalCode.EMPTY_RESPONSE) : outcomeFactory.apply(body);
     }
 

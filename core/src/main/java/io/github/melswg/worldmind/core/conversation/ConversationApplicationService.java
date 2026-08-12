@@ -1,6 +1,7 @@
 package io.github.melswg.worldmind.core.conversation;
 
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
@@ -27,9 +28,14 @@ public final class ConversationApplicationService {
             return scheduled(new ConversationRefusal(RefusalCode.PROVIDER_INCOMPATIBLE));
         }
 
+        Optional<ProviderRequest> providerRequest = promptBuilder.build(request);
+        if (providerRequest.isEmpty()) {
+            return scheduled(new ConversationRefusal(RefusalCode.PROMPT_BUDGET_EXCEEDED));
+        }
+
         CompletionStage<LanguageModelResult> completion;
         try {
-            completion = languageModel.complete(promptBuilder.build(request));
+            completion = languageModel.complete(providerRequest.orElseThrow());
             if (completion == null) {
                 completion = CompletableFuture.failedFuture(
                     new IllegalStateException("Language model returned no completion stage.")
@@ -58,8 +64,11 @@ public final class ConversationApplicationService {
         }
 
         ProviderResponse response = (ProviderResponse) result;
-        ConversationOutcome outcome = ParticipationProtocol.decode(response.text());
-        if (containsExactAddress(request) && !(outcome instanceof DirectReply)) {
+        ConversationOutcome outcome = ParticipationProtocol.decode(
+            response.text(),
+            request.validatedConfiguration().profile().responseLengthLimit()
+        );
+        if (containsExactAddress(request) && (outcome instanceof AmbientReply || outcome instanceof DeliberateSilence)) {
             return new ConversationRefusal(RefusalCode.INVALID_PROVIDER_RESPONSE);
         }
         return outcome;

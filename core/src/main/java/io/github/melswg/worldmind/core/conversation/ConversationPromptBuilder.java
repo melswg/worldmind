@@ -4,10 +4,11 @@ import io.github.melswg.worldmind.core.configuration.LoreMaterial;
 import io.github.melswg.worldmind.core.configuration.WorldmindProfile;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 /** Builds the fixed v1 prompt structure independently of provider transport details. */
 final class ConversationPromptBuilder {
-    ProviderRequest build(NormalizedServerRequest request) {
+    Optional<ProviderRequest> build(NormalizedServerRequest request) {
         WorldmindProfile profile = request.validatedConfiguration().profile();
         List<PromptLayer> layers = new ArrayList<>();
         layers.add(new PromptLayer(
@@ -45,7 +46,7 @@ final class ConversationPromptBuilder {
             request.chatBatch().messages().stream().map(this::chatMessageFragment).toList()
         ));
 
-        return new ProviderRequest(
+        return PromptBudgetPolicy.select(
             request.validatedConfiguration().globalConfiguration().provider().model(),
             request.validatedConfiguration().globalConfiguration().provider().generationParameters(),
             layers
