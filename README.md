@@ -7,9 +7,10 @@ character to Minecraft server chat.
 
 This repository contains the server-first bootstrap, strict v1 profile loading,
 provider-neutral core conversation assembly, a custom OpenAI-compatible Chat
-Completions transport, and bounded observation of accepted public server chat.
-It does not yet decide participation, deliver chat responses, or implement
-memory.
+Completions transport, bounded observation of accepted public server chat, and
+typed participation decisions for sealed chat batches. It does not yet deliver
+chat responses to Minecraft, implement memory, or provide Ticket 10 prompt
+budgeting and hostile-input/output hardening.
 
 ## Target platform
 
@@ -23,7 +24,7 @@ server, so the same path can serve dedicated servers and single-player worlds.
 ## Modules
 
 - `core` — Minecraft-independent authoritative bootstrap, public-chat batching,
-  and future domain code.
+  participation-decision protocol, and future domain code.
 - `fabric-1.20.1` — Fabric lifecycle adapter and the distributable mod artifact.
 - `testkit` — deterministic acceptance seam with a fake LLM, controlled clock,
   controllable server scheduler, and synthetic vanilla game context. It records

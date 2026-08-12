@@ -8,5 +8,5 @@ public enum PromptLayerType {
     LORE,
     MEMORY,
     CURRENT_GAME_CONTEXT,
-    PLAYER_MESSAGE
+    CURRENT_CHAT_BATCH
 }

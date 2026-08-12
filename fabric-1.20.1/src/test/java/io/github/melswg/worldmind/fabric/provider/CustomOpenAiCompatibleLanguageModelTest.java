@@ -21,15 +21,22 @@ import io.github.melswg.worldmind.core.configuration.WorldmindGlobalConfiguratio
 import io.github.melswg.worldmind.core.configuration.WorldmindProfile;
 import io.github.melswg.worldmind.core.conversation.ConversationOutcome;
 import io.github.melswg.worldmind.core.conversation.ConversationRefusal;
+import io.github.melswg.worldmind.core.conversation.DirectReply;
+import io.github.melswg.worldmind.core.conversation.AddressingSignal;
+import io.github.melswg.worldmind.core.conversation.ChatBatchSealReason;
+import io.github.melswg.worldmind.core.conversation.ObservedPublicChatMessage;
 import io.github.melswg.worldmind.core.conversation.ProviderCapabilities;
 import io.github.melswg.worldmind.core.conversation.RefusalCode;
-import io.github.melswg.worldmind.core.conversation.SafeServerResponse;
+import io.github.melswg.worldmind.core.conversation.SealedChatBatch;
+import io.github.melswg.worldmind.core.conversation.ServerRequester;
+import io.github.melswg.worldmind.core.conversation.UntrustedContext;
 import io.github.melswg.worldmind.core.conversation.WorldIdentity;
 import io.github.melswg.worldmind.testkit.FakeOpenAiCompatibleHttpServer;
 import io.github.melswg.worldmind.testkit.WorldmindAcceptanceScenario;
 import io.github.melswg.worldmind.testkit.WorldmindTestkit;
 import java.net.http.HttpClient;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -45,7 +52,7 @@ class CustomOpenAiCompatibleLanguageModelTest {
         try (FakeOpenAiCompatibleHttpServer server = new FakeOpenAiCompatibleHttpServer()) {
             SyntheticCredentialResolver credentials = SyntheticCredentialResolver.available();
             server.expectBearerCredential(credentials.materialForFakeServer());
-            server.respondWith(200, successfulResponse("The observatory is quiet."));
+            server.respondWith(200, successfulResponse("DIRECT_REPLY\nThe observatory is quiet."));
             server.holdResponses();
             ProviderConfiguration provider = provider(server, new GenerationParameters(
                 Optional.empty(),
@@ -59,20 +66,7 @@ class CustomOpenAiCompatibleLanguageModelTest {
             );
             WorldmindAcceptanceScenario scenario = WorldmindTestkit.scenario(languageModel);
 
-            var outcome = scenario.submit(scenario.normalizedRequest(
-                PLAYER_ID,
-                "Mira",
-                "Where can I find shelter?",
-                WORLD_ID,
-                new io.github.melswg.worldmind.testkit.SyntheticVanillaGameContext(
-                    "neutral-world",
-                    "minecraft:overworld",
-                    6_000,
-                    "rain"
-                ),
-                configuration(provider),
-                new ProviderCapabilities(true)
-            ));
+            var outcome = scenario.submit(chatBatch(), configuration(provider), new ProviderCapabilities(true));
 
             assertFalse(outcome.toCompletableFuture().isDone());
             FakeOpenAiCompatibleHttpServer.CapturedRequest captured = server.awaitRequest(ASYNC_TIMEOUT);
@@ -112,7 +106,7 @@ class CustomOpenAiCompatibleLanguageModelTest {
                 "LORE",
                 "MEMORY",
                 "CURRENT_GAME_CONTEXT",
-                "PLAYER_MESSAGE"
+                "CURRENT_CHAT_BATCH"
             );
             assertTrue(systemContent.contains("profile.administrator-rules"));
             assertTrue(systemContent.contains("profile.persona"));
@@ -132,7 +126,7 @@ class CustomOpenAiCompatibleLanguageModelTest {
             assertFalse(outcome.toCompletableFuture().isDone());
             scenario.serverScheduler().runUntilIdle();
 
-            SafeServerResponse response = assertInstanceOf(SafeServerResponse.class, outcome.toCompletableFuture().join());
+            DirectReply response = assertInstanceOf(DirectReply.class, outcome.toCompletableFuture().join());
             assertEquals("The observatory is quiet.", response.text());
         }
     }
@@ -212,15 +206,7 @@ class CustomOpenAiCompatibleLanguageModelTest {
         WorldmindAcceptanceScenario scenario,
         ValidatedWorldmindConfiguration configuration
     ) {
-        return scenario.submit(scenario.normalizedRequest(
-            PLAYER_ID,
-            "Mira",
-            "Where can I find shelter?",
-            WORLD_ID,
-            io.github.melswg.worldmind.testkit.SyntheticVanillaGameContext.overworld("neutral-world"),
-            configuration,
-            new ProviderCapabilities(true)
-        ));
+        return scenario.submit(chatBatch(), configuration, new ProviderCapabilities(true));
     }
 
     private ProviderConfiguration provider(FakeOpenAiCompatibleHttpServer server, GenerationParameters generation) {
@@ -255,7 +241,31 @@ class CustomOpenAiCompatibleLanguageModelTest {
     }
 
     private String successfulResponse(String content) {
-        return "{\"choices\":[{\"message\":{\"content\":\"" + content + "\"}}]}";
+        return "{\"choices\":[{\"message\":{\"content\":\"" + content
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            + "\"}}]}";
+    }
+
+    private SealedChatBatch chatBatch() {
+        return new SealedChatBatch(
+            WORLD_ID,
+            List.of(new ObservedPublicChatMessage(
+                1,
+                new ServerRequester(PLAYER_ID, "Mira"),
+                "Where can I find shelter?",
+                AddressingSignal.LIKELY,
+                Instant.EPOCH,
+                List.of()
+            )),
+            ChatBatchSealReason.ADDRESSING_SIGNAL,
+            List.of(new UntrustedContext(
+                "vanilla-game-context",
+                "worldName=neutral-world; dimension=minecraft:overworld; gameTime=6000; weather=rain"
+            ))
+        );
     }
 
     private void assertLayersInOrder(String content, String... layerNames) {

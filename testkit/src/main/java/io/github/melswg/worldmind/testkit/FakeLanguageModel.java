@@ -26,6 +26,21 @@ public final class FakeLanguageModel implements LanguageModel {
         return willCompleteWith(new ProviderResponse(responseText));
     }
 
+    /** Arranges a valid protocol direct-reply decision. */
+    public FakeLanguageModel willDirectReplyWith(String text) {
+        return willRespondWith("DIRECT_REPLY\n" + text);
+    }
+
+    /** Arranges a valid protocol ambient-reply decision. */
+    public FakeLanguageModel willAmbientReplyWith(String text) {
+        return willRespondWith("AMBIENT_REPLY\n" + text);
+    }
+
+    /** Arranges a valid protocol decision to remain silent. */
+    public FakeLanguageModel willRemainSilent() {
+        return willRespondWith("SILENT");
+    }
+
     public FakeLanguageModel willRefuseWith(RefusalCode code) {
         return willCompleteWith(new ProviderRefusal(code));
     }

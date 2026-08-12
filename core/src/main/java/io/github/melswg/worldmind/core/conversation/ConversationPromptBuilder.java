@@ -10,10 +10,13 @@ final class ConversationPromptBuilder {
     ProviderRequest build(NormalizedServerRequest request) {
         WorldmindProfile profile = request.validatedConfiguration().profile();
         List<PromptLayer> layers = new ArrayList<>();
-        layers.add(trusted(
+        layers.add(new PromptLayer(
             PromptLayerType.BUILT_IN_SAFETY_POLICY,
-            "worldmind.built-in-safety-policy",
-            BuiltInSafetyPolicy.CONTENT
+            PromptTrust.TRUSTED_INSTRUCTION,
+            List.of(
+                new PromptFragment("worldmind.built-in-safety-policy", BuiltInSafetyPolicy.CONTENT),
+                new PromptFragment(ParticipationProtocol.SOURCE, ParticipationProtocol.CONTENT)
+            )
         ));
         layers.add(trusted(
             PromptLayerType.ADMINISTRATOR_RULES,
@@ -34,12 +37,12 @@ final class ConversationPromptBuilder {
         layers.add(new PromptLayer(
             PromptLayerType.CURRENT_GAME_CONTEXT,
             PromptTrust.UNTRUSTED_DATA,
-            request.currentGameContext().stream().map(this::contextFragment).toList()
+            request.chatBatch().currentContextSnapshot().stream().map(this::contextFragment).toList()
         ));
         layers.add(new PromptLayer(
-            PromptLayerType.PLAYER_MESSAGE,
+            PromptLayerType.CURRENT_CHAT_BATCH,
             PromptTrust.UNTRUSTED_DATA,
-            List.of(new PromptFragment("player-message", request.message()))
+            request.chatBatch().messages().stream().map(this::chatMessageFragment).toList()
         ));
 
         return new ProviderRequest(
@@ -59,6 +62,15 @@ final class ConversationPromptBuilder {
 
     private PromptFragment contextFragment(UntrustedContext context) {
         return new PromptFragment(context.source(), context.content());
+    }
+
+    private PromptFragment chatMessageFragment(ObservedPublicChatMessage message) {
+        return new PromptFragment(
+            "public-chat-message.sequence-" + message.sequence(),
+            "visiblePlayerName: " + message.requester().playerName() + "\n"
+                + "addressingSignal: " + message.addressingSignal() + "\n"
+                + "message: " + message.message()
+        );
     }
 
     private String serializePersona(WorldmindProfile profile) {

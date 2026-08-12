@@ -3,19 +3,19 @@ package io.github.melswg.worldmind.testkit;
 import io.github.melswg.worldmind.core.conversation.ConversationApplicationService;
 import io.github.melswg.worldmind.core.conversation.ConversationOutcome;
 import io.github.melswg.worldmind.core.conversation.ChatBatchCoordinator;
+import io.github.melswg.worldmind.core.conversation.ChatBatchSealReason;
 import io.github.melswg.worldmind.core.conversation.LanguageModel;
 import io.github.melswg.worldmind.core.conversation.NormalizedServerRequest;
+import io.github.melswg.worldmind.core.conversation.ObservedPublicChatMessage;
 import io.github.melswg.worldmind.core.conversation.ProviderCapabilities;
-import io.github.melswg.worldmind.core.conversation.ServerRequester;
+import io.github.melswg.worldmind.core.conversation.SealedChatBatch;
 import io.github.melswg.worldmind.core.conversation.SealedChatBatchConsumer;
 import io.github.melswg.worldmind.core.conversation.UntrustedContext;
 import io.github.melswg.worldmind.core.conversation.WorldIdentity;
 import io.github.melswg.worldmind.core.configuration.ValidatedWorldmindConfiguration;
 import io.github.melswg.worldmind.core.configuration.ChatBatchingConfiguration;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 
 /**
@@ -51,8 +51,12 @@ public final class WorldmindAcceptanceScenario {
         return clock;
     }
 
-    public CompletionStage<ConversationOutcome> submit(NormalizedServerRequest request) {
-        return applicationService.handle(request);
+    public CompletionStage<ConversationOutcome> submit(
+        SealedChatBatch chatBatch,
+        ValidatedWorldmindConfiguration validatedConfiguration,
+        ProviderCapabilities providerCapabilities
+    ) {
+        return applicationService.handle(normalizedRequest(chatBatch, validatedConfiguration, providerCapabilities));
     }
 
     /** Creates the Ticket 07 batch boundary without invoking the scenario LLM. */
@@ -65,25 +69,24 @@ public final class WorldmindAcceptanceScenario {
     }
 
     public NormalizedServerRequest normalizedRequest(
-        UUID playerId,
-        String playerName,
-        String message,
-        WorldIdentity worldIdentity,
-        SyntheticVanillaGameContext vanillaContext,
+        SealedChatBatch chatBatch,
         ValidatedWorldmindConfiguration validatedConfiguration,
         ProviderCapabilities providerCapabilities
     ) {
-        List<UntrustedContext> context = new ArrayList<>();
-        if (vanillaContext != null) {
-            context.add(vanillaContext.asUntrustedContext());
-        }
         return new NormalizedServerRequest(
-            new ServerRequester(playerId, playerName),
-            worldIdentity,
-            message,
-            context,
+            chatBatch,
             validatedConfiguration,
             providerCapabilities
         );
+    }
+
+    /** Creates an explicit Ticket 07 sealed-batch handoff for decision tests. */
+    public SealedChatBatch sealedChatBatch(
+        WorldIdentity worldIdentity,
+        List<ObservedPublicChatMessage> messages,
+        ChatBatchSealReason sealReason,
+        List<UntrustedContext> currentContextSnapshot
+    ) {
+        return new SealedChatBatch(worldIdentity, messages, sealReason, currentContextSnapshot);
     }
 }

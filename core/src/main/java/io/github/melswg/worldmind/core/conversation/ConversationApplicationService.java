@@ -39,7 +39,7 @@ public final class ConversationApplicationService {
             completion = CompletableFuture.failedFuture(failure);
         }
 
-        return completion.handleAsync(this::toOutcome, serverScheduler);
+        return completion.handleAsync((result, failure) -> toOutcome(request, result, failure), serverScheduler);
     }
 
     private CompletionStage<ConversationOutcome> scheduled(ConversationOutcome outcome) {
@@ -48,7 +48,7 @@ public final class ConversationApplicationService {
         return scheduledOutcome;
     }
 
-    private ConversationOutcome toOutcome(LanguageModelResult result, Throwable failure) {
+    private ConversationOutcome toOutcome(NormalizedServerRequest request, LanguageModelResult result, Throwable failure) {
         if (failure != null || result == null) {
             return new ConversationRefusal(RefusalCode.PROVIDER_UNAVAILABLE);
         }
@@ -58,8 +58,15 @@ public final class ConversationApplicationService {
         }
 
         ProviderResponse response = (ProviderResponse) result;
-        return SafeServerResponse.fromUntrustedModelText(response.text())
-            .<ConversationOutcome>map(safeResponse -> safeResponse)
-            .orElseGet(() -> new ConversationRefusal(RefusalCode.EMPTY_RESPONSE));
+        ConversationOutcome outcome = ParticipationProtocol.decode(response.text());
+        if (containsExactAddress(request) && !(outcome instanceof DirectReply)) {
+            return new ConversationRefusal(RefusalCode.INVALID_PROVIDER_RESPONSE);
+        }
+        return outcome;
+    }
+
+    private boolean containsExactAddress(NormalizedServerRequest request) {
+        return request.chatBatch().messages().stream()
+            .anyMatch(message -> message.addressingSignal() == AddressingSignal.EXACT);
     }
 }
