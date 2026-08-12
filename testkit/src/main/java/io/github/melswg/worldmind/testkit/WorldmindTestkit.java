@@ -8,4 +8,8 @@ public final class WorldmindTestkit {
     public static WorldmindAcceptanceScenario scenario() {
         return new WorldmindAcceptanceScenario();
     }
+
+    public static FakeSecretResolver secretResolver() {
+        return new FakeSecretResolver();
+    }
 }
