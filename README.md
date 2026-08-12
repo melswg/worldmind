@@ -21,7 +21,9 @@ server, so the same path can serve dedicated servers and single-player worlds.
 
 - `core` — Minecraft-independent authoritative bootstrap and future domain code.
 - `fabric-1.20.1` — Fabric lifecycle adapter and the distributable mod artifact.
-- `testkit` — reserved namespace for deterministic test support.
+- `testkit` — deterministic acceptance seam with a fake LLM, controlled clock,
+  controllable server scheduler, and synthetic vanilla game context. It records
+  stable provider requests without HTTP, JSON, or a Minecraft client.
 
 ## Build
 
