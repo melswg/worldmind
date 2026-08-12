@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.melswg.worldmind.core.configuration.ConfigurationDiagnostic;
+import io.github.melswg.worldmind.core.configuration.ChatNameColor;
 import io.github.melswg.worldmind.core.configuration.DisabledWorldmindIntegration;
 import io.github.melswg.worldmind.core.configuration.EnabledWorldmindIntegration;
 import io.github.melswg.worldmind.core.configuration.IntegrationDisableReason;
@@ -48,6 +49,7 @@ class WorldmindStartupConfigurationLoaderTest {
         assertEquals("World details for Aster.", oracle.configuration().profile().loreMaterials().get(0).content());
         assertEquals("Speak calmly.", oracle.configuration().profile().responseStyle());
         assertEquals(280, oracle.configuration().profile().responseLengthLimit().maxCharacters());
+        assertEquals(ChatNameColor.LIGHT_PURPLE, oracle.configuration().profile().chatNameColor());
         assertEquals("Bramble", ranger.configuration().profile().characterName());
         assertEquals("Use short field notes.", ranger.configuration().profile().responseStyle());
         assertEquals(160, ranger.configuration().profile().responseLengthLimit().maxCharacters());
@@ -63,6 +65,55 @@ class WorldmindStartupConfigurationLoaderTest {
 
         String profileJson = Files.readString(profileDirectory("oracle").resolve("profile.json"), StandardCharsets.UTF_8);
         assertFalse(profileJson.contains("secretReference"));
+    }
+
+    @Test
+    void acceptsEveryExactVanillaChatNameColorAndDefaultsWhenTheOptionalFieldIsAbsent() throws IOException {
+        writeGlobal(true, "oracle", "{}", "env:WORLDMIND_TEST_KEY");
+        WorldmindStartupConfigurationLoader loader = new WorldmindStartupConfigurationLoader(
+            configurationDirectory,
+            WorldmindTestkit.secretResolver()
+        );
+
+        writeProfile("oracle", "Aster", "Measured and curious.", "Never claim server authority.", "Speak calmly.", 280);
+        EnabledWorldmindIntegration defaulted = assertInstanceOf(EnabledWorldmindIntegration.class, loader.load());
+        assertEquals(ChatNameColor.LIGHT_PURPLE, defaulted.configuration().profile().chatNameColor());
+
+        for (ChatNameColor color : ChatNameColor.values()) {
+            writeProfile(
+                "oracle",
+                "Aster",
+                "Measured and curious.",
+                "Never claim server authority.",
+                "Speak calmly.",
+                280,
+                color.profileValue()
+            );
+            EnabledWorldmindIntegration configured = assertInstanceOf(EnabledWorldmindIntegration.class, loader.load());
+            assertEquals(color, configured.configuration().profile().chatNameColor());
+        }
+    }
+
+    @Test
+    void rejectsUnknownOrNonStringChatNameColorAtTheProfileField() throws IOException {
+        writeGlobal(true, "oracle", "{}", "env:WORLDMIND_TEST_KEY");
+        writeProfile("oracle", "Aster", "Measured and curious.", "Never claim server authority.", "Speak calmly.", 280, "LIGHT_PURPLE");
+
+        DisabledWorldmindIntegration unknown = assertInstanceOf(
+            DisabledWorldmindIntegration.class,
+            new WorldmindStartupConfigurationLoader(configurationDirectory, WorldmindTestkit.secretResolver()).load()
+        );
+        assertDiagnostic(unknown.diagnostics(), "profile.chatNameColor", "case-sensitive vanilla color name");
+
+        Path profileFile = profileDirectory("oracle").resolve("profile.json");
+        String nonString = Files.readString(profileFile, StandardCharsets.UTF_8)
+            .replace("\"chatNameColor\": \"LIGHT_PURPLE\"", "\"chatNameColor\": 3");
+        Files.writeString(profileFile, nonString, StandardCharsets.UTF_8);
+        DisabledWorldmindIntegration wrongType = assertInstanceOf(
+            DisabledWorldmindIntegration.class,
+            new WorldmindStartupConfigurationLoader(configurationDirectory, WorldmindTestkit.secretResolver()).load()
+        );
+        assertDiagnostic(wrongType.diagnostics(), "profile.chatNameColor", "case-sensitive vanilla color name");
     }
 
     @Test
@@ -384,6 +435,26 @@ class WorldmindStartupConfigurationLoaderTest {
         String responseStyle,
         int responseLengthLimit
     ) throws IOException {
+        writeProfile(
+            profileId,
+            characterName,
+            persona,
+            administratorRules,
+            responseStyle,
+            responseLengthLimit,
+            null
+        );
+    }
+
+    private void writeProfile(
+        String profileId,
+        String characterName,
+        String persona,
+        String administratorRules,
+        String responseStyle,
+        int responseLengthLimit,
+        String chatNameColor
+    ) throws IOException {
         Path profile = profileDirectory(profileId);
         Files.createDirectories(profile.resolve("lore"));
         Files.writeString(profile.resolve("persona.md"), persona, StandardCharsets.UTF_8);
@@ -397,9 +468,14 @@ class WorldmindStartupConfigurationLoaderTest {
               "administratorRulesFile": "rules.md",
               "loreFiles": ["lore/world.md"],
               "responseStyle": "%s",
-              "responseLengthLimit": %d
+              "responseLengthLimit": %d%s
             }
-            """.formatted(characterName, responseStyle, responseLengthLimit), StandardCharsets.UTF_8);
+            """.formatted(
+                characterName,
+                responseStyle,
+                responseLengthLimit,
+                chatNameColor == null ? "" : ",\n  \"chatNameColor\": \"" + chatNameColor + "\""
+            ), StandardCharsets.UTF_8);
     }
 
     private Path profileDirectory(String profileId) {

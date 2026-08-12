@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.melswg.worldmind.core.configuration.ChatBatchingConfiguration;
+import io.github.melswg.worldmind.core.configuration.ChatNameColor;
 import io.github.melswg.worldmind.core.configuration.ExternalSecretReference;
 import io.github.melswg.worldmind.core.configuration.GenerationParameters;
 import io.github.melswg.worldmind.core.configuration.LoreMaterial;
@@ -198,6 +199,26 @@ class ConversationAcceptanceSeamTest {
             baseline,
             providerRequest(baselineProfile, singleAmbientBatch("Where can I find shelter?")),
             PromptLayerType.CURRENT_CHAT_BATCH
+        );
+    }
+
+    @Test
+    void keepsPresentationOnlyChatNameColorOutOfTheProviderRequest() {
+        WorldmindProfile defaultProfile = profile("Keep the peace.", "A thoughtful guide.", lore(), "calm", 280);
+        WorldmindProfile coloredProfile = new WorldmindProfile(
+            WorldmindProfile.V1_SCHEMA_VERSION,
+            "Aster",
+            "A thoughtful guide.",
+            "Keep the peace.",
+            lore(),
+            "calm",
+            new ResponseLengthLimit(280),
+            ChatNameColor.GOLD
+        );
+
+        assertEquals(
+            providerRequest(defaultProfile, singleAmbientBatch("The bridge is wet.")),
+            providerRequest(coloredProfile, singleAmbientBatch("The bridge is wet."))
         );
     }
 

@@ -14,7 +14,8 @@ public record WorldmindProfile(
     String administratorRules,
     List<LoreMaterial> loreMaterials,
     String responseStyle,
-    ResponseLengthLimit responseLengthLimit
+    ResponseLengthLimit responseLengthLimit,
+    ChatNameColor chatNameColor
 ) {
     public static final int V1_SCHEMA_VERSION = 1;
 
@@ -31,6 +32,29 @@ public record WorldmindProfile(
         }
         responseStyle = requireText(responseStyle, "responseStyle");
         Objects.requireNonNull(responseLengthLimit, "responseLengthLimit");
+        Objects.requireNonNull(chatNameColor, "chatNameColor");
+    }
+
+    /** Preserves the original v1 Java construction contract with its delivery default. */
+    public WorldmindProfile(
+        int schemaVersion,
+        String characterName,
+        String persona,
+        String administratorRules,
+        List<LoreMaterial> loreMaterials,
+        String responseStyle,
+        ResponseLengthLimit responseLengthLimit
+    ) {
+        this(
+            schemaVersion,
+            characterName,
+            persona,
+            administratorRules,
+            loreMaterials,
+            responseStyle,
+            responseLengthLimit,
+            ChatNameColor.LIGHT_PURPLE
+        );
     }
 
     private static String requireText(String value, String name) {

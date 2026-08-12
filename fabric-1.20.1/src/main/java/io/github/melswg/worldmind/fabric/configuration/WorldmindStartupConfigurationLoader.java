@@ -6,6 +6,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.JsonParseException;
 import io.github.melswg.worldmind.core.configuration.ConfigurationDiagnostic;
+import io.github.melswg.worldmind.core.configuration.ChatNameColor;
 import io.github.melswg.worldmind.core.configuration.ChatBatchingConfiguration;
 import io.github.melswg.worldmind.core.configuration.DisabledWorldmindIntegration;
 import io.github.melswg.worldmind.core.configuration.EnabledWorldmindIntegration;
@@ -71,7 +72,8 @@ public final class WorldmindStartupConfigurationLoader {
         "administratorRulesFile",
         "loreFiles",
         "responseStyle",
-        "responseLengthLimit"
+        "responseLengthLimit",
+        "chatNameColor"
     );
 
     private final Path configurationDirectory;
@@ -122,7 +124,8 @@ public final class WorldmindStartupConfigurationLoader {
             profile.administratorRules(),
             profile.loreMaterials(),
             profile.responseStyle(),
-            new ResponseLengthLimit(profile.responseLengthLimit())
+            new ResponseLengthLimit(profile.responseLengthLimit()),
+            profile.chatNameColor()
         );
         ValidatedWorldmindConfiguration validated = new ValidatedWorldmindConfiguration(globalConfiguration, worldmindProfile);
 
@@ -365,6 +368,7 @@ public final class WorldmindStartupConfigurationLoader {
         String administratorRulesFile = requiredString(profile, "administratorRulesFile", "profile", diagnostics);
         String responseStyle = requiredString(profile, "responseStyle", "profile", diagnostics);
         Integer responseLengthLimit = requiredInteger(profile, "responseLengthLimit", "profile", diagnostics);
+        ChatNameColor chatNameColor = optionalChatNameColor(profile, diagnostics);
         if (responseLengthLimit != null && responseLengthLimit <= 0) {
             diagnostic(diagnostics, "profile.responseLengthLimit", "must be a positive number of characters.");
         }
@@ -385,7 +389,7 @@ public final class WorldmindStartupConfigurationLoader {
 
         if (schemaVersion == null || characterName == null || persona == null || administratorRules == null
             || responseStyle == null || responseLengthLimit == null || responseLengthLimit <= 0
-            || loreMaterials == null) {
+            || loreMaterials == null || chatNameColor == null) {
             return null;
         }
         return new ParsedProfile(
@@ -395,8 +399,24 @@ public final class WorldmindStartupConfigurationLoader {
             administratorRules,
             loreMaterials,
             responseStyle,
-            responseLengthLimit
+            responseLengthLimit,
+            chatNameColor
         );
+    }
+
+    private ChatNameColor optionalChatNameColor(JsonObject profile, List<ConfigurationDiagnostic> diagnostics) {
+        if (!profile.has("chatNameColor")) {
+            return ChatNameColor.LIGHT_PURPLE;
+        }
+        JsonElement value = profile.get("chatNameColor");
+        if (!isString(value)) {
+            diagnostic(diagnostics, "profile.chatNameColor", "must be a supported case-sensitive vanilla color name.");
+            return null;
+        }
+        return ChatNameColor.fromProfileValue(value.getAsString()).orElseGet(() -> {
+            diagnostic(diagnostics, "profile.chatNameColor", "must be a supported case-sensitive vanilla color name.");
+            return null;
+        });
     }
 
     private List<LoreMaterial> readLoreMaterials(
@@ -723,7 +743,8 @@ public final class WorldmindStartupConfigurationLoader {
         String administratorRules,
         List<LoreMaterial> loreMaterials,
         String responseStyle,
-        int responseLengthLimit
+        int responseLengthLimit,
+        ChatNameColor chatNameColor
     ) {
     }
 }

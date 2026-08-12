@@ -8,6 +8,7 @@ import io.github.melswg.worldmind.core.conversation.ProviderResponse;
 import io.github.melswg.worldmind.core.conversation.RefusalCode;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -24,6 +25,24 @@ public final class FakeLanguageModel implements LanguageModel {
 
     public FakeLanguageModel willRespondWith(String responseText) {
         return willCompleteWith(new ProviderResponse(responseText));
+    }
+
+    /** Arranges raw provider outputs in request order for deterministic delivery tests. */
+    public FakeLanguageModel willRespondWithSequence(String... responseTexts) {
+        Objects.requireNonNull(responseTexts, "responseTexts");
+        List<String> responses = List.of(responseTexts.clone());
+        if (responses.isEmpty() || responses.stream().anyMatch(Objects::isNull)) {
+            throw new IllegalArgumentException("responseTexts must contain at least one non-null response.");
+        }
+        AtomicInteger next = new AtomicInteger();
+        scenario = request -> {
+            int index = next.getAndIncrement();
+            if (index >= responses.size()) {
+                return CompletableFuture.failedFuture(new IllegalStateException("No fake response remains for the request."));
+            }
+            return CompletableFuture.completedFuture(new ProviderResponse(responses.get(index)));
+        };
+        return this;
     }
 
     /** Arranges a valid protocol direct-reply decision. */

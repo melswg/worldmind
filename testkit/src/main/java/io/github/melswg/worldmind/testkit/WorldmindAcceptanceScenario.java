@@ -2,12 +2,14 @@ package io.github.melswg.worldmind.testkit;
 
 import io.github.melswg.worldmind.core.conversation.ConversationApplicationService;
 import io.github.melswg.worldmind.core.conversation.ConversationOutcome;
+import io.github.melswg.worldmind.core.conversation.ConversationRefusal;
 import io.github.melswg.worldmind.core.conversation.ChatBatchCoordinator;
 import io.github.melswg.worldmind.core.conversation.ChatBatchSealReason;
 import io.github.melswg.worldmind.core.conversation.LanguageModel;
 import io.github.melswg.worldmind.core.conversation.NormalizedServerRequest;
 import io.github.melswg.worldmind.core.conversation.ObservedPublicChatMessage;
 import io.github.melswg.worldmind.core.conversation.ProviderCapabilities;
+import io.github.melswg.worldmind.core.conversation.RefusalCode;
 import io.github.melswg.worldmind.core.conversation.SealedChatBatch;
 import io.github.melswg.worldmind.core.conversation.SealedChatBatchConsumer;
 import io.github.melswg.worldmind.core.conversation.UntrustedContext;
@@ -17,6 +19,7 @@ import io.github.melswg.worldmind.core.configuration.ChatBatchingConfiguration;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.CompletionStage;
+import java.util.function.BiConsumer;
 
 /**
  * Reusable high-level DSL for server-side Worldmind acceptance scenarios.
@@ -51,6 +54,11 @@ public final class WorldmindAcceptanceScenario {
         return clock;
     }
 
+    /** Exposes the one scenario-owned application service to adapter acceptance tests. */
+    public ConversationApplicationService applicationService() {
+        return applicationService;
+    }
+
     public CompletionStage<ConversationOutcome> submit(
         SealedChatBatch chatBatch,
         ValidatedWorldmindConfiguration validatedConfiguration,
@@ -66,6 +74,37 @@ public final class WorldmindAcceptanceScenario {
         SealedChatBatchConsumer consumer
     ) {
         return new ChatBatchCoordinator(configuration, characterName, clock, serverScheduler, consumer);
+    }
+
+    /**
+     * Extends the existing batching seam through the one application service to
+     * an outcome consumer. The outcome is observed only after the deterministic
+     * server scheduler runs.
+     */
+    public ChatBatchCoordinator decidingChatBatcher(
+        ChatBatchingConfiguration batchingConfiguration,
+        String characterName,
+        ValidatedWorldmindConfiguration validatedConfiguration,
+        ProviderCapabilities providerCapabilities,
+        BiConsumer<SealedChatBatch, ConversationOutcome> outcomeConsumer
+    ) {
+        java.util.Objects.requireNonNull(validatedConfiguration, "validatedConfiguration");
+        java.util.Objects.requireNonNull(providerCapabilities, "providerCapabilities");
+        BiConsumer<SealedChatBatch, ConversationOutcome> consumer = java.util.Objects.requireNonNull(
+            outcomeConsumer,
+            "outcomeConsumer"
+        );
+        return chatBatcher(batchingConfiguration, characterName, batch -> applicationService.handle(
+            normalizedRequest(batch, validatedConfiguration, providerCapabilities)
+        ).handle((outcome, failure) -> {
+            consumer.accept(
+                batch,
+                failure == null && outcome != null
+                    ? outcome
+                    : new ConversationRefusal(RefusalCode.PROVIDER_UNAVAILABLE)
+            );
+            return null;
+        }));
     }
 
     public NormalizedServerRequest normalizedRequest(

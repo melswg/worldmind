@@ -17,6 +17,7 @@ class WorldmindFabricMetadataTest {
         assertTrue(metadata.contains("\"minecraft\": \"~1.20.1\""));
         assertTrue(metadata.contains("\"environment\": \"*\""));
         assertTrue(metadata.contains("\"main\""));
+        assertTrue(metadata.contains("\"fabric-message-api-v1\""));
         assertFalse(metadata.contains("\"client\""));
     }
 

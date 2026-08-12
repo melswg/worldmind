@@ -8,8 +8,8 @@ character to Minecraft server chat.
 This repository contains the server-first bootstrap, strict v1 profile loading,
 provider-neutral core conversation assembly, a custom OpenAI-compatible Chat
 Completions transport, bounded observation of accepted public server chat, and
-typed participation decisions for sealed chat batches. It does not yet deliver
-chat responses to Minecraft, implement memory, or provide Ticket 10 prompt
+typed participation decisions and selective server-chat delivery for sealed
+chat batches. It does not yet implement memory or provide Ticket 10 prompt
 budgeting and hostile-input/output hardening.
 
 ## Target platform
@@ -75,9 +75,16 @@ The selected profile contains only portable character material in
   "administratorRulesFile": "rules.md",
   "loreFiles": ["lore/world.md"],
   "responseStyle": "calm and concise",
-  "responseLengthLimit": 280
+  "responseLengthLimit": 280,
+  "chatNameColor": "light_purple"
 }
 ```
+
+`chatNameColor` is optional and controls only the Worldmind name used in
+server-chat delivery. It defaults to `light_purple` and accepts one exact
+vanilla palette name: `black`, `dark_blue`, `dark_green`, `dark_aqua`,
+`dark_red`, `dark_purple`, `gold`, `gray`, `dark_gray`, `blue`, `green`,
+`aqua`, `red`, `light_purple`, `yellow`, or `white`.
 
 `secretReference` belongs only in the global configuration; portable profiles
 cannot contain it. v1 accepts only `env:NAME`, read from the server process

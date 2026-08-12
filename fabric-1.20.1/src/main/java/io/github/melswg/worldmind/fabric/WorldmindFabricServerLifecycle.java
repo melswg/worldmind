@@ -5,9 +5,12 @@ import io.github.melswg.worldmind.core.WorldmindAuthoritativeRuntime;
 import io.github.melswg.worldmind.core.configuration.DisabledWorldmindIntegration;
 import io.github.melswg.worldmind.core.configuration.EnabledWorldmindIntegration;
 import io.github.melswg.worldmind.core.configuration.WorldmindIntegrationState;
+import io.github.melswg.worldmind.core.conversation.ProviderCapabilities;
 import io.github.melswg.worldmind.core.conversation.WorldIdentity;
 import io.github.melswg.worldmind.fabric.configuration.WorldmindStartupConfigurationLoader;
+import io.github.melswg.worldmind.fabric.provider.CustomOpenAiCompatibleLanguageModel;
 import io.github.melswg.worldmind.fabric.provider.EnvironmentProviderCredentialResolver;
+import io.github.melswg.worldmind.fabric.provider.ProviderCredentialResolver;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.network.message.MessageLink;
 import net.minecraft.network.message.SignedMessage;
@@ -25,18 +28,24 @@ final class WorldmindFabricServerLifecycle {
 
     private final AuthoritativeWorldmindInitializer authoritativeInitializer;
     private final WorldmindStartupConfigurationLoader configurationLoader;
+    private final ProviderCredentialResolver providerCredentials;
     private final FabricCommandBroadcastCorrelation commandBroadcastCorrelation = new FabricCommandBroadcastCorrelation();
     private WorldmindAuthoritativeRuntime runtime;
     private FabricChatObservationRuntime chatObservation;
     private WorldIdentityLifecycle worldIdentity;
 
     WorldmindFabricServerLifecycle() {
+        this(new EnvironmentProviderCredentialResolver());
+    }
+
+    private WorldmindFabricServerLifecycle(EnvironmentProviderCredentialResolver providerCredentials) {
         this(
             new AuthoritativeWorldmindInitializer(),
             new WorldmindStartupConfigurationLoader(
                 FabricLoader.getInstance().getConfigDir().resolve("worldmind"),
-                new EnvironmentProviderCredentialResolver()
-            )
+                providerCredentials
+            ),
+            providerCredentials
         );
     }
 
@@ -44,8 +53,17 @@ final class WorldmindFabricServerLifecycle {
         AuthoritativeWorldmindInitializer authoritativeInitializer,
         WorldmindStartupConfigurationLoader configurationLoader
     ) {
+        this(authoritativeInitializer, configurationLoader, new EnvironmentProviderCredentialResolver());
+    }
+
+    WorldmindFabricServerLifecycle(
+        AuthoritativeWorldmindInitializer authoritativeInitializer,
+        WorldmindStartupConfigurationLoader configurationLoader,
+        ProviderCredentialResolver providerCredentials
+    ) {
         this.authoritativeInitializer = authoritativeInitializer;
         this.configurationLoader = configurationLoader;
+        this.providerCredentials = providerCredentials;
     }
 
     synchronized void onServerStarted(MinecraftServer server) {
@@ -53,8 +71,7 @@ final class WorldmindFabricServerLifecycle {
         WorldmindIntegrationState integrationState = configurationLoader.load();
         runtime = authoritativeInitializer.initialize(integrationState);
         if (server != null && integrationState instanceof EnabledWorldmindIntegration enabled) {
-            worldIdentity = new WorldIdentityLifecycle();
-            chatObservation = new FabricChatObservationRuntime(enabled.configuration());
+            startChatRuntime(server, enabled);
         }
         logStartupState(integrationState);
     }
@@ -101,6 +118,43 @@ final class WorldmindFabricServerLifecycle {
         } else {
             LOGGER.info("Worldmind configuration validated; LLM integration is ready.");
         }
+    }
+
+    private void startChatRuntime(MinecraftServer server, EnabledWorldmindIntegration enabled) {
+        WorldIdentityLifecycle identity = new WorldIdentityLifecycle();
+        try {
+            chatObservation = FabricChatObservationRuntime.createProduction(
+                server,
+                identity.identity(),
+                enabled.configuration(),
+                CustomOpenAiCompatibleLanguageModel.create(
+                    enabled.configuration().globalConfiguration().provider(),
+                    providerCredentials
+                ),
+                new ProviderCapabilities(true),
+                this::logDeliveryDiagnostic
+            );
+            worldIdentity = identity;
+        } catch (RuntimeException failure) {
+            LOGGER.warn("Worldmind chat runtime could not start: {}.", failure.getClass().getSimpleName());
+        }
+    }
+
+    private void logDeliveryDiagnostic(FabricChatDeliveryDiagnostic diagnostic) {
+        diagnostic.refusalCode().ifPresentOrElse(
+            code -> LOGGER.warn(
+                "Worldmind chat batch {}-{} ended with {}.",
+                diagnostic.firstSequence(),
+                diagnostic.lastSequence(),
+                code
+            ),
+            () -> LOGGER.warn(
+                "Worldmind {} for chat batch {}-{}.",
+                diagnostic.kind(),
+                diagnostic.firstSequence(),
+                diagnostic.lastSequence()
+            )
+        );
     }
 
     private void closeChatObservation() {
