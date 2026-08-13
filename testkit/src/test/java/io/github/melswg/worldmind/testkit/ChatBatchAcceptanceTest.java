@@ -9,12 +9,15 @@ import io.github.melswg.worldmind.core.conversation.AddressingSignal;
 import io.github.melswg.worldmind.core.conversation.ChatBatchAdmission;
 import io.github.melswg.worldmind.core.conversation.ChatBatchCoordinator;
 import io.github.melswg.worldmind.core.conversation.ChatBatchSealReason;
+import io.github.melswg.worldmind.core.conversation.CharacterNameAddressingDetector;
+import io.github.melswg.worldmind.core.conversation.ObservedPublicChatMessage;
 import io.github.melswg.worldmind.core.conversation.SealedChatBatch;
 import io.github.melswg.worldmind.core.conversation.SealedChatBatchConsumer;
 import io.github.melswg.worldmind.core.conversation.ServerRequester;
 import io.github.melswg.worldmind.core.conversation.UntrustedContext;
 import io.github.melswg.worldmind.core.conversation.WorldIdentity;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -29,6 +32,7 @@ class ChatBatchAcceptanceTest {
         UUID.fromString("6eac0fe2-1ce7-47fc-9fb7-cd98778b467a"),
         "Mira"
     );
+    private final java.util.Map<WorldIdentity, Long> nextSequences = new java.util.HashMap<>();
 
     @Test
     void observesVanillaStyleMessageWithoutMutatingItAndDoesNotCallTheTicket06LanguageModel() {
@@ -194,12 +198,11 @@ class ChatBatchAcceptanceTest {
     }
 
     private ChatBatchAdmission observe(ChatBatchCoordinator batcher, WorldIdentity world, String message) {
-        return batcher.observe(
-            world,
-            PLAYER,
-            message,
+        long sequence = nextSequences.merge(world, 1L, Long::sum);
+        return batcher.observe(new ObservedPublicChatMessage(
+            sequence, PLAYER, message, new CharacterNameAddressingDetector("Майни").detect(message), Instant.EPOCH,
             List.of(new UntrustedContext("vanilla-game-context", "dimension=minecraft:overworld; gameTime=0; weather=clear"))
-        );
+        ), world);
     }
 
     private static final class RecordingConsumer implements SealedChatBatchConsumer {

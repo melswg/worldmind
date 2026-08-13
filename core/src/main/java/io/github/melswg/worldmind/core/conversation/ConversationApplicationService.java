@@ -1,5 +1,8 @@
 package io.github.melswg.worldmind.core.conversation;
 
+import io.github.melswg.worldmind.core.memory.MemoryRecord;
+import io.github.melswg.worldmind.core.memory.WorldMemoryRepository;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -14,10 +17,20 @@ public final class ConversationApplicationService {
     private final LanguageModel languageModel;
     private final Executor serverScheduler;
     private final ConversationPromptBuilder promptBuilder;
+    private final WorldMemoryRepository memoryRepository;
 
     public ConversationApplicationService(LanguageModel languageModel, Executor serverScheduler) {
+        this(languageModel, serverScheduler, WorldMemoryRepository.empty());
+    }
+
+    public ConversationApplicationService(
+        LanguageModel languageModel,
+        Executor serverScheduler,
+        WorldMemoryRepository memoryRepository
+    ) {
         this.languageModel = Objects.requireNonNull(languageModel, "languageModel");
         this.serverScheduler = Objects.requireNonNull(serverScheduler, "serverScheduler");
+        this.memoryRepository = Objects.requireNonNull(memoryRepository, "memoryRepository");
         this.promptBuilder = new ConversationPromptBuilder();
     }
 
@@ -27,8 +40,33 @@ public final class ConversationApplicationService {
         if (!request.providerCapabilities().supportsSystemInstructions()) {
             return scheduled(new ConversationRefusal(RefusalCode.PROVIDER_INCOMPATIBLE));
         }
+        if (memoryRepository == WorldMemoryRepository.empty()) {
+            return handleWithMemory(request, List.of());
+        }
 
-        Optional<ProviderRequest> providerRequest = promptBuilder.build(request);
+        CompletionStage<List<MemoryRecord>> recalled;
+        try {
+            recalled = memoryRepository.recallPublic(request.chatBatch());
+            if (recalled == null) {
+                recalled = CompletableFuture.failedFuture(new IllegalStateException("Memory repository returned no recall stage."));
+            }
+        } catch (RuntimeException failure) {
+            recalled = CompletableFuture.failedFuture(failure);
+        }
+
+        return recalled.<CompletionStage<ConversationOutcome>>handleAsync((memory, failure) -> {
+            if (failure != null || memory == null) {
+                return CompletableFuture.completedFuture(new ConversationRefusal(RefusalCode.MEMORY_UNAVAILABLE));
+            }
+            return handleWithMemory(request, memory);
+        }, serverScheduler).thenCompose(stage -> stage);
+    }
+
+    private CompletionStage<ConversationOutcome> handleWithMemory(
+        NormalizedServerRequest request,
+        List<MemoryRecord> memory
+    ) {
+        Optional<ProviderRequest> providerRequest = promptBuilder.build(request, memory);
         if (providerRequest.isEmpty()) {
             return scheduled(new ConversationRefusal(RefusalCode.PROMPT_BUDGET_EXCEEDED));
         }

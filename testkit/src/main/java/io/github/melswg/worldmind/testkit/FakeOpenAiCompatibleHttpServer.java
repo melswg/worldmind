@@ -14,6 +14,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -23,6 +25,7 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class FakeOpenAiCompatibleHttpServer implements AutoCloseable {
     private final HttpServer server;
     private final CompletableFuture<CapturedRequest> receivedRequest = new CompletableFuture<>();
+    private final BlockingQueue<CapturedRequest> receivedRequests = new LinkedBlockingQueue<>();
     private final AtomicReference<Response> response = new AtomicReference<>(new Response(200, "{}"));
     private final AtomicReference<CountDownLatch> responseGate = new AtomicReference<>(new CountDownLatch(0));
     private volatile String expectedAuthorization;
@@ -75,6 +78,20 @@ public final class FakeOpenAiCompatibleHttpServer implements AutoCloseable {
         return receivedRequest.isDone();
     }
 
+    /** Waits for the next request when an acceptance scenario intentionally makes several provider calls. */
+    public CapturedRequest awaitNextRequest(Duration timeout) {
+        try {
+            CapturedRequest request = receivedRequests.poll(timeout.toMillis(), TimeUnit.MILLISECONDS);
+            if (request == null) throw new TimeoutException("No loopback request arrived before the timeout.");
+            return request;
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while waiting for a loopback request.", failure);
+        } catch (TimeoutException failure) {
+            throw new IllegalStateException("Loopback request was not received in time.", failure);
+        }
+    }
+
     private void handle(HttpExchange exchange) throws IOException {
         String authorization = exchange.getRequestHeaders().getFirst("Authorization");
         boolean authorizationMatchesExpected = expectedAuthorization != null && expectedAuthorization.equals(authorization);
@@ -88,6 +105,7 @@ public final class FakeOpenAiCompatibleHttpServer implements AutoCloseable {
             new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)
         );
         receivedRequest.complete(captured);
+        receivedRequests.add(captured);
 
         try {
             responseGate.get().await();

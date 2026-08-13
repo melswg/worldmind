@@ -15,12 +15,19 @@ import io.github.melswg.worldmind.core.conversation.RefusalCode;
 import io.github.melswg.worldmind.core.conversation.ServerRequester;
 import io.github.melswg.worldmind.core.conversation.UntrustedContext;
 import io.github.melswg.worldmind.core.conversation.WorldIdentity;
+import io.github.melswg.worldmind.core.journal.DialogueJournal;
+import io.github.melswg.worldmind.core.journal.JournalBatchOutcome;
+import io.github.melswg.worldmind.core.journal.JournalDeliveryReport;
+import io.github.melswg.worldmind.core.journal.JournalParticipationDecision;
+import io.github.melswg.worldmind.core.journal.JournaledBatch;
+import io.github.melswg.worldmind.core.journal.ProviderAttemptOutcome;
+import io.github.melswg.worldmind.core.memory.WorldMemoryRepository;
 import java.time.Clock;
 import java.util.List;
 import java.util.Objects;
-import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.network.message.SignedMessage;
 import net.minecraft.server.MinecraftServer;
@@ -38,6 +45,9 @@ final class FabricChatObservationRuntime implements AutoCloseable {
     private final AtomicBoolean active = new AtomicBoolean(true);
     private final AutoCloseable delayedSchedulerCloser;
     private final AutoCloseable serverSchedulerCloser;
+    private final DialogueJournal journal;
+    private final Executor serverScheduler;
+    private final Clock clock;
     private final ConversationApplicationService applicationService;
     private final ProviderCapabilities providerCapabilities;
     private final FabricChatOutcomeRouter outcomeRouter;
@@ -46,6 +56,7 @@ final class FabricChatObservationRuntime implements AutoCloseable {
     static FabricChatObservationRuntime createProduction(
         MinecraftServer server,
         WorldIdentity ownedWorld,
+        DialogueJournal journal,
         ValidatedWorldmindConfiguration configuration,
         LanguageModel languageModel,
         ProviderCapabilities providerCapabilities,
@@ -56,12 +67,20 @@ final class FabricChatObservationRuntime implements AutoCloseable {
             FabricServerScheduler serverScheduler = new FabricServerScheduler(server);
             return new FabricChatObservationRuntime(
                 ownedWorld,
+                journal,
                 configuration,
                 Clock.systemUTC(),
                 delayedScheduler,
                 delayedScheduler,
                 serverScheduler,
-                new ConversationApplicationService(languageModel, serverScheduler),
+                serverScheduler,
+                new ConversationApplicationService(
+                    languageModel,
+                    serverScheduler,
+                    journal instanceof WorldMemoryRepository memoryRepository
+                        ? memoryRepository
+                        : WorldMemoryRepository.empty()
+                ),
                 providerCapabilities,
                 new FabricServerChatSink(server),
                 diagnostics
@@ -74,21 +93,26 @@ final class FabricChatObservationRuntime implements AutoCloseable {
 
     FabricChatObservationRuntime(
         WorldIdentity ownedWorld,
+        DialogueJournal journal,
         ValidatedWorldmindConfiguration configuration,
         Clock clock,
         DelayedScheduler delayedScheduler,
         AutoCloseable delayedSchedulerCloser,
         AutoCloseable serverSchedulerCloser,
+        Executor serverScheduler,
         ConversationApplicationService applicationService,
         ProviderCapabilities providerCapabilities,
         ServerChatSink chatSink,
         FabricChatDiagnostics diagnostics
     ) {
         this.ownedWorld = Objects.requireNonNull(ownedWorld, "ownedWorld");
+        this.journal = Objects.requireNonNull(journal, "journal");
         ValidatedWorldmindConfiguration validated = Objects.requireNonNull(configuration, "configuration");
         this.configuration = validated;
         this.delayedSchedulerCloser = Objects.requireNonNull(delayedSchedulerCloser, "delayedSchedulerCloser");
         this.serverSchedulerCloser = Objects.requireNonNull(serverSchedulerCloser, "serverSchedulerCloser");
+        this.serverScheduler = Objects.requireNonNull(serverScheduler, "serverScheduler");
+        this.clock = Objects.requireNonNull(clock, "clock");
         this.applicationService = Objects.requireNonNull(applicationService, "applicationService");
         this.providerCapabilities = Objects.requireNonNull(providerCapabilities, "providerCapabilities");
         this.outcomeRouter = new FabricChatOutcomeRouter(
@@ -102,20 +126,35 @@ final class FabricChatObservationRuntime implements AutoCloseable {
         batchCoordinator = new ChatBatchCoordinator(
             validated.globalConfiguration().chatBatching(),
             validated.profile().characterName(),
-            Objects.requireNonNull(clock, "clock"),
+            this.clock,
             Objects.requireNonNull(delayedScheduler, "delayedScheduler"),
             this::decideAndDeliver
         );
     }
 
     void observeAcceptedPlayerChat(SignedMessage message, ServerPlayerEntity sender, WorldIdentity worldIdentity) {
-        String originalMessage = message.getContent().getString();
-        String visiblePlayerName = sender.getDisplayName().getString();
-        UUID playerId = sender.getUuid();
-        List<UntrustedContext> context = List.of(normalizeVanillaContext(sender));
         if (active.get() && ownedWorld.equals(worldIdentity)) {
-            batchCoordinator.observe(worldIdentity, new ServerRequester(playerId, visiblePlayerName), originalMessage, context);
+            observeCapturedPublicChat(captureAcceptedPlayerChat(message, sender, configuration.profile().characterName(), clock), worldIdentity);
         }
+    }
+
+    /** Copies Fabric values synchronously so journal work never retains Minecraft objects past this callback. */
+    static CapturedPublicChatMessage captureAcceptedPlayerChat(
+        SignedMessage message,
+        ServerPlayerEntity sender,
+        String characterName,
+        Clock clock
+    ) {
+        Objects.requireNonNull(message, "message");
+        Objects.requireNonNull(sender, "sender");
+        String originalMessage = message.getContent().getString();
+        return new CapturedPublicChatMessage(
+            new ServerRequester(sender.getUuid(), sender.getDisplayName().getString()),
+            originalMessage,
+            new io.github.melswg.worldmind.core.conversation.CharacterNameAddressingDetector(characterName).detect(originalMessage),
+            Objects.requireNonNull(clock, "clock").instant(),
+            List.of(normalizeVanillaContext(sender))
+        );
     }
 
     /** Package-visible deterministic seam after the Fabric callback has copied its values. */
@@ -125,7 +164,21 @@ final class FabricChatObservationRuntime implements AutoCloseable {
         if (!active.get() || !ownedWorld.equals(worldIdentity)) {
             return ChatBatchAdmission.IGNORED_AFTER_CLOSE;
         }
-        return batchCoordinator.observe(captured, worldIdentity);
+        journal.appendObservation(captured).whenComplete((observation, failure) -> serverScheduler.execute(() -> {
+            if (!active.get()) {
+                return;
+            }
+            if (failure != null || observation == null) {
+                outcomeRouter.notifyStorageUnavailable(captured);
+                return;
+            }
+            try {
+                batchCoordinator.observe(observation.toObservedPublicChatMessage(captured.currentContext()), worldIdentity);
+            } catch (RuntimeException ignored) {
+                outcomeRouter.notifyStorageUnavailable(captured);
+            }
+        }));
+        return ChatBatchAdmission.QUEUED_FOR_JOURNAL;
     }
 
     @Override
@@ -136,33 +189,80 @@ final class FabricChatObservationRuntime implements AutoCloseable {
         batchCoordinator.close();
         closeQuietly(delayedSchedulerCloser);
         closeQuietly(serverSchedulerCloser);
+        journal.closeAsync();
     }
 
     private CompletionStage<?> decideAndDeliver(io.github.melswg.worldmind.core.conversation.SealedChatBatch batch) {
         if (!active.get() || !ownedWorld.equals(batch.worldIdentity())) {
             return CompletableFuture.completedFuture(null);
         }
-        try {
-            return applicationService.handle(new NormalizedServerRequest(batch, configuration, providerCapabilities))
-                .handle((outcome, failure) -> {
-                    if (!active.get()) {
-                        return null;
-                    }
-                    ConversationOutcome resolved = failure == null && outcome != null
-                        ? outcome
-                        : new ConversationRefusal(RefusalCode.PROVIDER_UNAVAILABLE);
-                    outcomeRouter.deliver(batch, resolved);
-                    return null;
+        CompletableFuture<Void> completed = new CompletableFuture<>();
+        journal.appendBatch(batch).whenComplete((journaledBatch, persistenceFailure) -> {
+            if (persistenceFailure != null || journaledBatch == null) {
+                serverScheduler.execute(() -> {
+                    if (active.get()) outcomeRouter.deliver(batch, new ConversationRefusal(RefusalCode.JOURNAL_UNAVAILABLE));
+                    completed.complete(null);
                 });
-        } catch (RuntimeException failure) {
-            if (active.get()) {
-                outcomeRouter.deliver(batch, new ConversationRefusal(RefusalCode.PROVIDER_UNAVAILABLE));
+                return;
             }
-            return CompletableFuture.completedFuture(null);
-        }
+            try {
+                applicationService.handle(new NormalizedServerRequest(batch, configuration, providerCapabilities))
+                    .whenComplete((outcome, failure) -> serverScheduler.execute(() ->
+                        finishJournaledBatch(batch, journaledBatch, outcome, failure, completed)
+                    ));
+            } catch (RuntimeException failure) {
+                serverScheduler.execute(() -> finishJournaledBatch(batch, journaledBatch, null, failure, completed));
+            }
+        });
+        return completed;
     }
 
-    private UntrustedContext normalizeVanillaContext(ServerPlayerEntity sender) {
+    private void finishJournaledBatch(
+        io.github.melswg.worldmind.core.conversation.SealedChatBatch batch,
+        JournaledBatch journaledBatch,
+        ConversationOutcome outcome,
+        Throwable failure,
+        CompletableFuture<Void> completed
+    ) {
+        if (!active.get()) {
+            completed.complete(null);
+            return;
+        }
+        ConversationOutcome resolved = failure == null && outcome != null
+            ? outcome
+            : new ConversationRefusal(RefusalCode.PROVIDER_UNAVAILABLE);
+        JournalDeliveryReport delivery = outcomeRouter.deliver(batch, resolved);
+        JournalBatchOutcome audit = journalOutcome(journaledBatch, resolved, delivery);
+        journal.appendOutcome(audit).whenComplete((ignored, journalFailure) -> completed.complete(null));
+    }
+
+    private JournalBatchOutcome journalOutcome(
+        JournaledBatch batch,
+        ConversationOutcome outcome,
+        JournalDeliveryReport delivery
+    ) {
+        if (outcome instanceof io.github.melswg.worldmind.core.conversation.DirectReply) {
+            return new JournalBatchOutcome(batch.batchId(), ProviderAttemptOutcome.SUCCEEDED,
+                java.util.Optional.of(JournalParticipationDecision.DIRECT_REPLY), java.util.Optional.empty(), delivery, clock.instant());
+        }
+        if (outcome instanceof io.github.melswg.worldmind.core.conversation.AmbientReply) {
+            return new JournalBatchOutcome(batch.batchId(), ProviderAttemptOutcome.SUCCEEDED,
+                java.util.Optional.of(JournalParticipationDecision.AMBIENT_REPLY), java.util.Optional.empty(), delivery, clock.instant());
+        }
+        if (outcome instanceof io.github.melswg.worldmind.core.conversation.DeliberateSilence) {
+            return new JournalBatchOutcome(batch.batchId(), ProviderAttemptOutcome.SUCCEEDED,
+                java.util.Optional.of(JournalParticipationDecision.SILENT), java.util.Optional.empty(), delivery, clock.instant());
+        }
+        ConversationRefusal refusal = (ConversationRefusal) outcome;
+        ProviderAttemptOutcome providerResult = switch (refusal.code()) {
+            case PROVIDER_INCOMPATIBLE, PROMPT_BUDGET_EXCEEDED, MEMORY_UNAVAILABLE -> ProviderAttemptOutcome.NOT_ATTEMPTED;
+            default -> ProviderAttemptOutcome.FAILED;
+        };
+        return new JournalBatchOutcome(batch.batchId(), providerResult,
+            java.util.Optional.empty(), java.util.Optional.of(refusal.code()), delivery, clock.instant());
+    }
+
+    private static UntrustedContext normalizeVanillaContext(ServerPlayerEntity sender) {
         ServerWorld world = sender.getServerWorld();
         String weather = world.isThundering() ? "thunder" : world.isRaining() ? "rain" : "clear";
         return new UntrustedContext(

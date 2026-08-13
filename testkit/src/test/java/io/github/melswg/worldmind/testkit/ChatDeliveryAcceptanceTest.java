@@ -16,17 +16,20 @@ import io.github.melswg.worldmind.core.configuration.WorldmindGlobalConfiguratio
 import io.github.melswg.worldmind.core.configuration.WorldmindProfile;
 import io.github.melswg.worldmind.core.conversation.AmbientReply;
 import io.github.melswg.worldmind.core.conversation.ChatBatchCoordinator;
+import io.github.melswg.worldmind.core.conversation.CharacterNameAddressingDetector;
 import io.github.melswg.worldmind.core.conversation.ConversationOutcome;
 import io.github.melswg.worldmind.core.conversation.ConversationRefusal;
 import io.github.melswg.worldmind.core.conversation.DeliberateSilence;
 import io.github.melswg.worldmind.core.conversation.DirectReply;
 import io.github.melswg.worldmind.core.conversation.ProviderCapabilities;
+import io.github.melswg.worldmind.core.conversation.ObservedPublicChatMessage;
 import io.github.melswg.worldmind.core.conversation.RefusalCode;
 import io.github.melswg.worldmind.core.conversation.SealedChatBatch;
 import io.github.melswg.worldmind.core.conversation.ServerRequester;
 import io.github.melswg.worldmind.core.conversation.UntrustedContext;
 import io.github.melswg.worldmind.core.conversation.WorldIdentity;
 import java.net.URI;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -45,6 +48,7 @@ class ChatDeliveryAcceptanceTest {
         "vanilla-game-context",
         "dimension=minecraft:overworld; weather=clear"
     );
+    private long nextSequence;
 
     @Test
     void sendsOneOrderedSealedBatchThroughTheExistingServiceOnlyWhenTheServerSchedulerRuns() {
@@ -136,7 +140,9 @@ class ChatDeliveryAcceptanceTest {
     }
 
     private void observe(ChatBatchCoordinator batcher, String text) {
-        batcher.observe(WORLD, MIRA, text, List.of(CONTEXT));
+        batcher.observe(new ObservedPublicChatMessage(
+            ++nextSequence, MIRA, text, new CharacterNameAddressingDetector("Aster").detect(text), Instant.EPOCH, List.of(CONTEXT)
+        ), WORLD);
     }
 
     private ValidatedWorldmindConfiguration configuration(ChatBatchingConfiguration batching) {

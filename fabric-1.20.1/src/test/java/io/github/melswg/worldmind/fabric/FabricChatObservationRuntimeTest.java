@@ -22,14 +22,29 @@ import io.github.melswg.worldmind.core.conversation.ProviderCapabilities;
 import io.github.melswg.worldmind.core.conversation.ServerRequester;
 import io.github.melswg.worldmind.core.conversation.UntrustedContext;
 import io.github.melswg.worldmind.core.conversation.WorldIdentity;
+import io.github.melswg.worldmind.core.journal.DialogueJournal;
+import io.github.melswg.worldmind.core.journal.DialogueJournalSnapshot;
+import io.github.melswg.worldmind.core.journal.JournalBatchOutcome;
+import io.github.melswg.worldmind.core.journal.JournaledBatch;
+import io.github.melswg.worldmind.core.journal.JournaledObservation;
+import io.github.melswg.worldmind.core.journal.ProviderAttemptOutcome;
+import io.github.melswg.worldmind.core.memory.MemoryConfirmationRequest;
+import io.github.melswg.worldmind.core.memory.MemoryRecord;
+import io.github.melswg.worldmind.core.memory.MemoryRecordId;
+import io.github.melswg.worldmind.core.memory.ProposedMemoryCandidate;
+import io.github.melswg.worldmind.core.memory.WorldMemoryRepository;
+import io.github.melswg.worldmind.core.memory.WorldMemorySnapshot;
 import io.github.melswg.worldmind.testkit.WorldmindAcceptanceScenario;
 import io.github.melswg.worldmind.testkit.WorldmindTestkit;
+import io.github.melswg.worldmind.testkit.InMemoryDialogueJournal;
 import java.net.URI;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import net.minecraft.text.Text;
 import org.junit.jupiter.api.Test;
 
@@ -48,8 +63,7 @@ class FabricChatObservationRuntimeTest {
         RecordingSink sink = new RecordingSink();
         FabricChatObservationRuntime runtime = runtime(scenario, sink);
 
-        assertEquals(ChatBatchAdmission.SEALED_FOR_HANDOFF, runtime.observeCapturedPublicChat(captured("Aster!", AddressingSignal.EXACT), WORLD));
-        assertEquals(1, scenario.languageModel().receivedRequests().size());
+        assertEquals(ChatBatchAdmission.QUEUED_FOR_JOURNAL, runtime.observeCapturedPublicChat(captured("Aster!", AddressingSignal.EXACT), WORLD));
         assertTrue(sink.broadcasts.isEmpty());
 
         scenario.serverScheduler().runUntilIdle();
@@ -71,7 +85,6 @@ class FabricChatObservationRuntimeTest {
         assertTrue(scenario.languageModel().receivedRequests().isEmpty());
 
         runtime.observeCapturedPublicChat(captured("Aster!", AddressingSignal.EXACT), WORLD);
-        assertEquals(1, scenario.languageModel().receivedRequests().size());
         runtime.close();
         scenario.serverScheduler().runUntilIdle();
 
@@ -89,7 +102,6 @@ class FabricChatObservationRuntimeTest {
 
         runtime.observeCapturedPublicChat(captured("Aster!", AddressingSignal.EXACT), WORLD);
         runtime.observeCapturedPublicChat(captured("Aster?", AddressingSignal.EXACT), WORLD);
-        assertEquals(1, scenario.languageModel().receivedRequests().size());
 
         scenario.serverScheduler().runUntilIdle();
 
@@ -146,14 +158,63 @@ class FabricChatObservationRuntimeTest {
         assertTrue(ambientSink.privateMessages.isEmpty());
     }
 
+    @Test
+    void failsClosedWhenRawJournalPersistenceIsUnavailableWithoutCallingTheProvider() {
+        WorldmindAcceptanceScenario scenario = WorldmindTestkit.scenario();
+        scenario.languageModel().willDirectReplyWith("must not reach the provider");
+        RecordingSink sink = new RecordingSink();
+        FabricChatObservationRuntime runtime = runtime(scenario, sink, new FailingJournal());
+
+        runtime.observeCapturedPublicChat(captured("Aster!", AddressingSignal.EXACT), WORLD);
+        runtime.observeCapturedPublicChat(captured("The rain is loud.", AddressingSignal.NONE), WORLD);
+        scenario.serverScheduler().runUntilIdle();
+
+        assertTrue(scenario.languageModel().receivedRequests().isEmpty());
+        assertEquals(1, sink.privateMessages.size());
+        assertTrue(sink.broadcasts.isEmpty());
+    }
+
+    @Test
+    void failsClosedWhenPublicMemoryRecallIsUnavailableAndAuditsTheActualPrivateDelivery() {
+        WorldmindAcceptanceScenario scenario = new WorldmindAcceptanceScenario(
+            new io.github.melswg.worldmind.testkit.FakeLanguageModel(), new FailingMemoryRepository()
+        );
+        RecordingSink sink = new RecordingSink();
+        InMemoryDialogueJournal journal = new InMemoryDialogueJournal(WORLD, scenario.clock());
+        FabricChatObservationRuntime runtime = runtime(scenario, sink, journal);
+
+        runtime.observeCapturedPublicChat(captured("Aster!", AddressingSignal.EXACT), WORLD);
+        scenario.serverScheduler().runUntilIdle();
+
+        assertTrue(scenario.languageModel().receivedRequests().isEmpty());
+        assertTrue(sink.broadcasts.isEmpty());
+        assertEquals(1, sink.privateMessages.size());
+        JournalBatchOutcome outcome = join(journal.readSnapshot()).outcomes().values().iterator().next();
+        assertEquals(ProviderAttemptOutcome.NOT_ATTEMPTED, outcome.providerAttemptOutcome());
+        assertEquals(io.github.melswg.worldmind.core.conversation.RefusalCode.MEMORY_UNAVAILABLE,
+            outcome.refusalCode().orElseThrow());
+        assertEquals(io.github.melswg.worldmind.core.journal.JournalDeliveryStatus.PRIVATE_UNAVAILABLE_DELIVERED,
+            outcome.delivery().status());
+    }
+
     private FabricChatObservationRuntime runtime(WorldmindAcceptanceScenario scenario, RecordingSink sink) {
+        return runtime(scenario, sink, new InMemoryDialogueJournal(WORLD, scenario.clock()));
+    }
+
+    private FabricChatObservationRuntime runtime(
+        WorldmindAcceptanceScenario scenario,
+        RecordingSink sink,
+        DialogueJournal journal
+    ) {
         return new FabricChatObservationRuntime(
             WORLD,
+            journal,
             configuration(),
             scenario.clock(),
             scenario.serverScheduler(),
             () -> { },
             () -> { },
+            scenario.serverScheduler(),
             scenario.applicationService(),
             new ProviderCapabilities(true),
             sink,
@@ -210,6 +271,56 @@ class FabricChatObservationRuntimeTest {
     }
 
     private record PrivateMessage(UUID playerId, Text message) {
+    }
+
+    private static final class FailingJournal implements DialogueJournal {
+        @Override public CompletionStage<WorldIdentity> worldIdentity() {
+            return CompletableFuture.completedFuture(WORLD);
+        }
+
+        @Override public CompletionStage<JournaledObservation> appendObservation(CapturedPublicChatMessage observation) {
+            return CompletableFuture.failedFuture(new IllegalStateException("temporary SQLite failure"));
+        }
+
+        @Override public CompletionStage<JournaledBatch> appendBatch(io.github.melswg.worldmind.core.conversation.SealedChatBatch batch) {
+            return CompletableFuture.failedFuture(new IllegalStateException("unused"));
+        }
+
+        @Override public CompletionStage<Void> appendOutcome(JournalBatchOutcome outcome) {
+            return CompletableFuture.failedFuture(new IllegalStateException("unused"));
+        }
+
+        @Override public CompletionStage<DialogueJournalSnapshot> readSnapshot() {
+            return CompletableFuture.failedFuture(new IllegalStateException("unused"));
+        }
+
+        @Override public CompletionStage<Void> closeAsync() {
+            return CompletableFuture.completedFuture(null);
+        }
+    }
+
+    private static final class FailingMemoryRepository implements WorldMemoryRepository {
+        @Override public CompletionStage<List<MemoryRecord>> appendProposed(
+            JournaledBatch sourceBatch, List<? extends ProposedMemoryCandidate> candidates
+        ) {
+            return CompletableFuture.failedFuture(new UnsupportedOperationException("unused"));
+        }
+
+        @Override public CompletionStage<MemoryRecord> confirm(MemoryRecordId recordId, MemoryConfirmationRequest confirmation) {
+            return CompletableFuture.failedFuture(new UnsupportedOperationException("unused"));
+        }
+
+        @Override public CompletionStage<List<MemoryRecord>> recallPublic(io.github.melswg.worldmind.core.conversation.SealedChatBatch nextBatch) {
+            return CompletableFuture.failedFuture(new IllegalStateException("temporary SQLite read failure"));
+        }
+
+        @Override public CompletionStage<WorldMemorySnapshot> readMemorySnapshot() {
+            return CompletableFuture.failedFuture(new UnsupportedOperationException("unused"));
+        }
+    }
+
+    private static <T> T join(CompletionStage<T> stage) {
+        return stage.toCompletableFuture().join();
     }
 
     private void assertNoInteractiveStyle(Text text) {

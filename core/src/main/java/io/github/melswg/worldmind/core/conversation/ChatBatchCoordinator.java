@@ -1,7 +1,6 @@
 package io.github.melswg.worldmind.core.conversation;
 
 import io.github.melswg.worldmind.core.configuration.ChatBatchingConfiguration;
-import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -17,8 +16,6 @@ import java.util.concurrent.CompletionStage;
  */
 public final class ChatBatchCoordinator implements AutoCloseable {
     private final ChatBatchingConfiguration configuration;
-    private final CharacterNameAddressingDetector addressingDetector;
-    private final Clock clock;
     private final DelayedScheduler delayedScheduler;
     private final SealedChatBatchConsumer consumer;
     private final Map<WorldIdentity, WorldState> worlds = new HashMap<>();
@@ -27,7 +24,7 @@ public final class ChatBatchCoordinator implements AutoCloseable {
     public ChatBatchCoordinator(
         ChatBatchingConfiguration configuration,
         String characterName,
-        Clock clock,
+        java.time.Clock clock,
         DelayedScheduler delayedScheduler,
         SealedChatBatchConsumer consumer
     ) {
@@ -37,38 +34,23 @@ public final class ChatBatchCoordinator implements AutoCloseable {
     public ChatBatchCoordinator(
         ChatBatchingConfiguration configuration,
         CharacterNameAddressingDetector addressingDetector,
-        Clock clock,
+        java.time.Clock clock,
         DelayedScheduler delayedScheduler,
         SealedChatBatchConsumer consumer
     ) {
         this.configuration = Objects.requireNonNull(configuration, "configuration");
-        this.addressingDetector = Objects.requireNonNull(addressingDetector, "addressingDetector");
-        this.clock = Objects.requireNonNull(clock, "clock");
+        Objects.requireNonNull(addressingDetector, "addressingDetector");
+        Objects.requireNonNull(clock, "clock");
         this.delayedScheduler = Objects.requireNonNull(delayedScheduler, "delayedScheduler");
         this.consumer = Objects.requireNonNull(consumer, "consumer");
     }
 
     /**
-     * Assigns a sequence and admits one already accepted public player message.
+     * Admits one durably sequenced public player message.
      * It never waits for a timer or batch-consumer completion.
      */
-    public ChatBatchAdmission observe(
-        WorldIdentity worldIdentity,
-        ServerRequester requester,
-        String message,
-        List<UntrustedContext> currentContext
-    ) {
-        return observe(new CapturedPublicChatMessage(
-            requester,
-            message,
-            addressingDetector.detect(message),
-            clock.instant(),
-            currentContext
-        ), worldIdentity);
-    }
-
-    public ChatBatchAdmission observe(CapturedPublicChatMessage captured, WorldIdentity worldIdentity) {
-        Objects.requireNonNull(captured, "captured");
+    public ChatBatchAdmission observe(ObservedPublicChatMessage observed, WorldIdentity worldIdentity) {
+        Objects.requireNonNull(observed, "observed");
         Objects.requireNonNull(worldIdentity, "worldIdentity");
         List<SealedChatBatch> handoffs = new ArrayList<>(1);
         ChatBatchAdmission admission;
@@ -92,14 +74,10 @@ public final class ChatBatchCoordinator implements AutoCloseable {
                 scheduleDeadline(worldIdentity, state, pending);
             }
 
-            ObservedPublicChatMessage observed = new ObservedPublicChatMessage(
-                nextSequence(state),
-                captured.requester(),
-                captured.message(),
-                captured.addressingSignal(),
-                captured.capturedAt(),
-                captured.currentContext()
-            );
+            if (observed.sequence() <= state.lastObservedSequence) {
+                throw new IllegalArgumentException("Observed messages must have strictly increasing per-world sequences.");
+            }
+            state.lastObservedSequence = observed.sequence();
             pending.messages.add(observed);
             pending.estimatedInputSize = ChatBatchInputEstimator.saturatedAdd(
                 pending.estimatedInputSize,
@@ -247,13 +225,6 @@ public final class ChatBatchCoordinator implements AutoCloseable {
         return null;
     }
 
-    private static long nextSequence(WorldState state) {
-        if (state.nextSequence == Long.MAX_VALUE) {
-            throw new IllegalStateException("Per-world chat sequence is exhausted.");
-        }
-        return ++state.nextSequence;
-    }
-
     private static void cancel(PendingBatch pending) {
         if (pending != null && pending.deadline != null) {
             pending.deadline.cancel();
@@ -262,7 +233,7 @@ public final class ChatBatchCoordinator implements AutoCloseable {
     }
 
     private static final class WorldState {
-        private long nextSequence;
+        private long lastObservedSequence;
         private PendingBatch pending;
         private SealedChatBatch inFlight;
         private PendingBatch nextPending;

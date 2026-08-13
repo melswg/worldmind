@@ -65,6 +65,14 @@ class WorldmindFabricServerLifecycleTest {
         assertEquals(1, secrets.resolutionCount());
     }
 
+    @Test
+    void resolvesTheDialogueDatabaseInsideTheWorldSaveRatherThanGlobalConfiguration() {
+        assertEquals(
+            configurationDirectory.resolve("worldmind").resolve("worldmind.sqlite3"),
+            WorldmindFabricServerLifecycle.journalDatabasePath(configurationDirectory)
+        );
+    }
+
     private void writeValidConfiguration() throws IOException {
         Path profile = configurationDirectory.resolve("profiles/oracle");
         Files.createDirectories(profile.resolve("lore"));

@@ -10,6 +10,8 @@ import io.github.melswg.worldmind.core.conversation.ObservedPublicChatMessage;
 import io.github.melswg.worldmind.core.conversation.SealedChatBatch;
 import io.github.melswg.worldmind.core.conversation.ServerRequester;
 import io.github.melswg.worldmind.core.conversation.WorldIdentity;
+import io.github.melswg.worldmind.core.journal.JournalDeliveryReport;
+import io.github.melswg.worldmind.core.journal.JournalDeliveryStatus;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -41,76 +43,81 @@ final class FabricChatOutcomeRouter {
         this.diagnostics = Objects.requireNonNull(diagnostics, "diagnostics");
     }
 
-    void deliver(SealedChatBatch batch, ConversationOutcome outcome) {
+    JournalDeliveryReport deliver(SealedChatBatch batch, ConversationOutcome outcome) {
         Objects.requireNonNull(batch, "batch");
         Objects.requireNonNull(outcome, "outcome");
         if (!active.getAsBoolean() || !ownedWorld.equals(batch.worldIdentity())) {
-            return;
+            return new JournalDeliveryReport(JournalDeliveryStatus.ROUTING_SKIPPED, Optional.empty());
         }
         if (outcome instanceof DirectReply directReply) {
-            deliverDirect(batch, directReply);
+            return deliverDirect(batch, directReply);
         } else if (outcome instanceof AmbientReply ambientReply) {
-            deliverAmbient(batch, ambientReply);
+            return deliverAmbient(batch, ambientReply);
         } else if (outcome instanceof ConversationRefusal refusal) {
-            deliverRefusal(batch, refusal);
+            return deliverRefusal(batch, refusal);
         }
         // DeliberateSilence deliberately has no player-facing or diagnostic output.
+        return JournalDeliveryReport.noOutput();
     }
 
-    private void deliverDirect(SealedChatBatch batch, DirectReply reply) {
+    void notifyStorageUnavailable(io.github.melswg.worldmind.core.conversation.CapturedPublicChatMessage captured) {
+        Objects.requireNonNull(captured, "captured");
+        if (active.getAsBoolean() && captured.addressingSignal() == AddressingSignal.EXACT) {
+            sendPrivateFailure(captured.requester());
+        }
+    }
+
+    private JournalDeliveryReport deliverDirect(SealedChatBatch batch, DirectReply reply) {
         try {
             chatSink.broadcast(render(reply.text()));
+            return new JournalDeliveryReport(JournalDeliveryStatus.PUBLIC_REPLY_DELIVERED, Optional.of(reply.text()));
         } catch (RuntimeException failure) {
             record(FabricChatDeliveryDiagnostic.delivery(
                 FabricChatDeliveryDiagnosticKind.DIRECT_DELIVERY_FAILED,
                 firstSequence(batch),
                 lastSequence(batch)
             ));
-            fallbackForDirectDeliveryFailure(batch);
+            return fallbackForDirectDeliveryFailure(batch);
         }
     }
 
-    private void deliverAmbient(SealedChatBatch batch, AmbientReply reply) {
+    private JournalDeliveryReport deliverAmbient(SealedChatBatch batch, AmbientReply reply) {
         try {
             chatSink.broadcast(render(reply.text()));
+            return new JournalDeliveryReport(JournalDeliveryStatus.PUBLIC_REPLY_DELIVERED, Optional.of(reply.text()));
         } catch (RuntimeException failure) {
             record(FabricChatDeliveryDiagnostic.delivery(
                 FabricChatDeliveryDiagnosticKind.AMBIENT_DELIVERY_FAILED,
                 firstSequence(batch),
                 lastSequence(batch)
             ));
+            return new JournalDeliveryReport(JournalDeliveryStatus.PUBLIC_REPLY_DELIVERY_FAILED, Optional.empty());
         }
     }
 
-    private void deliverRefusal(SealedChatBatch batch, ConversationRefusal refusal) {
+    private JournalDeliveryReport deliverRefusal(SealedChatBatch batch, ConversationRefusal refusal) {
         record(FabricChatDeliveryDiagnostic.refusal(firstSequence(batch), lastSequence(batch), refusal.code()));
-        latestWithSignal(batch.messages(), AddressingSignal.EXACT).ifPresent(requester ->
-            sendPrivateFailure(batch, requester)
-        );
+        return latestWithSignal(batch.messages(), AddressingSignal.EXACT)
+            .map(this::sendPrivateFailure)
+            .orElseGet(JournalDeliveryReport::noOutput);
     }
 
-    private void fallbackForDirectDeliveryFailure(SealedChatBatch batch) {
+    private JournalDeliveryReport fallbackForDirectDeliveryFailure(SealedChatBatch batch) {
         Optional<ServerRequester> recipient = latestWithSignal(batch.messages(), AddressingSignal.EXACT)
             .or(() -> latestWithSignal(batch.messages(), AddressingSignal.LIKELY))
             .or(() -> Optional.of(batch.messages().get(batch.messages().size() - 1).requester()));
-        recipient.ifPresent(requester -> sendPrivateFailure(batch, requester));
+        return recipient.map(this::sendPrivateFailure)
+            .orElse(new JournalDeliveryReport(JournalDeliveryStatus.PUBLIC_REPLY_DELIVERY_FAILED, Optional.empty()));
     }
 
-    private void sendPrivateFailure(SealedChatBatch batch, ServerRequester requester) {
+    private JournalDeliveryReport sendPrivateFailure(ServerRequester requester) {
         try {
             if (!chatSink.sendPrivate(requester.playerId(), FabricWorldmindChatRenderer.unavailable(characterName, chatNameColor))) {
-                record(FabricChatDeliveryDiagnostic.delivery(
-                    FabricChatDeliveryDiagnosticKind.PRIVATE_RECIPIENT_UNAVAILABLE,
-                    firstSequence(batch),
-                    lastSequence(batch)
-                ));
+                return new JournalDeliveryReport(JournalDeliveryStatus.PRIVATE_UNAVAILABLE_UNDELIVERABLE, Optional.empty());
             }
+            return new JournalDeliveryReport(JournalDeliveryStatus.PRIVATE_UNAVAILABLE_DELIVERED, Optional.empty());
         } catch (RuntimeException failure) {
-            record(FabricChatDeliveryDiagnostic.delivery(
-                FabricChatDeliveryDiagnosticKind.PRIVATE_DELIVERY_FAILED,
-                firstSequence(batch),
-                lastSequence(batch)
-            ));
+            return new JournalDeliveryReport(JournalDeliveryStatus.PRIVATE_UNAVAILABLE_UNDELIVERABLE, Optional.empty());
         }
     }
 

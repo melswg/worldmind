@@ -16,6 +16,7 @@ import io.github.melswg.worldmind.core.conversation.UntrustedContext;
 import io.github.melswg.worldmind.core.conversation.WorldIdentity;
 import io.github.melswg.worldmind.core.configuration.ValidatedWorldmindConfiguration;
 import io.github.melswg.worldmind.core.configuration.ChatBatchingConfiguration;
+import io.github.melswg.worldmind.core.memory.WorldMemoryRepository;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.CompletionStage;
@@ -35,8 +36,16 @@ public final class WorldmindAcceptanceScenario {
     }
 
     public WorldmindAcceptanceScenario(LanguageModel languageModel) {
+        this(languageModel, WorldMemoryRepository.empty());
+    }
+
+    public WorldmindAcceptanceScenario(LanguageModel languageModel, WorldMemoryRepository memoryRepository) {
         this.languageModel = java.util.Objects.requireNonNull(languageModel, "languageModel");
-        this.applicationService = new ConversationApplicationService(this.languageModel, serverScheduler);
+        this.applicationService = new ConversationApplicationService(
+            this.languageModel,
+            serverScheduler,
+            java.util.Objects.requireNonNull(memoryRepository, "memoryRepository")
+        );
     }
 
     public FakeLanguageModel languageModel() {
