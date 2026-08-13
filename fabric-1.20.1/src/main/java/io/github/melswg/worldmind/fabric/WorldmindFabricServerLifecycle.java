@@ -465,6 +465,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
                 || lifecycleState == RuntimeLifecycleState.STOPPED) return;
             integrationState = state;
             runtime = authoritativeInitializer.initialize(state);
+            installRetentionIfReady(state);
             lifecycleState = RuntimeLifecycleState.RUNNING;
             installChatRuntimeIfReady(startedServer, generation);
         }
@@ -489,6 +490,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
                 journal = opened;
                 worldIdentity = new WorldIdentityLifecycle(opened.openedWorldIdentity());
                 storageHealth = StorageHealth.READY;
+                installRetentionIfReady(integrationState);
                 installChatRuntimeIfReady(startedServer, generation);
             }
         }, () -> {
@@ -552,6 +554,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
             chatObservation = null;
             integrationState = candidate;
             runtime = authoritativeInitializer.initialize(candidate);
+            installRetentionIfReady(candidate);
             if (candidate instanceof EnabledWorldmindIntegration enabled) {
                 pendingJournalStart = new PendingJournalStart(newGeneration, enabled.configuration().profile().characterName(),
                     enabled.configuration().profile().chatNameColor());
@@ -582,6 +585,26 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
 
     private CompletionStage<WorldmindIntegrationState> loadAsync() {
         return CompletableFuture.supplyAsync(this::loadConfiguration, administrationExecutor);
+    }
+
+    /** Applies use-gates immediately; finite expiry is paged on non-server workers. */
+    private void installRetentionIfReady(WorldmindIntegrationState state) {
+        if (!(state instanceof EnabledWorldmindIntegration enabled) || journal == null) return;
+        var policy = enabled.configuration().globalConfiguration().dialogueRetention();
+        journal.configureRetention(policy);
+        if (policy.hasFiniteAge()) scheduleRetentionSweep(journal, policy, lifecycleGeneration);
+    }
+
+    private void scheduleRetentionSweep(SqliteDialogueJournal target, io.github.melswg.worldmind.core.configuration.DialogueRetentionConfiguration policy, long generation) {
+        target.sweepDialogueRetention(policy, Clock.systemUTC().instant()).whenComplete((result, failure) -> {
+            if (failure != null || result == null || !result.moreRemaining()) return;
+            CompletableFuture.delayedExecutor(1, java.util.concurrent.TimeUnit.SECONDS, administrationExecutor).execute(() -> {
+                synchronized (this) {
+                    if (generation != lifecycleGeneration || target != journal || lifecycleState != RuntimeLifecycleState.RUNNING) return;
+                }
+                scheduleRetentionSweep(target, policy, generation);
+            });
+        });
     }
 
     private WorldmindIntegrationState loadConfiguration() {

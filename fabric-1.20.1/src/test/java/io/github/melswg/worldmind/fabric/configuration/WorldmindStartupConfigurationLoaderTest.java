@@ -119,11 +119,35 @@ class WorldmindStartupConfigurationLoaderTest {
     }
 
     @Test
+    void loadsStrictV2DialogueRetentionAndMapsV1ToTheDocumentedDefaults() throws IOException {
+        writeProfile("oracle", "Aster", "Measured and curious.", "Never claim server authority.", "Speak calmly.", 280);
+        writeGlobal(true, "oracle", "{}", "env:WORLDMIND_TEST_KEY");
+        EnabledWorldmindIntegration legacy = assertInstanceOf(EnabledWorldmindIntegration.class,
+            new WorldmindStartupConfigurationLoader(configurationDirectory, WorldmindTestkit.secretResolver()).load());
+        assertEquals(0, legacy.configuration().globalConfiguration().dialogueRetention().maximumRawAgeDays());
+        assertTrue(legacy.configuration().globalConfiguration().dialogueRetention().persistRawObservations());
+
+        Path global = configurationDirectory.resolve("worldmind.json");
+        String v2 = Files.readString(global, StandardCharsets.UTF_8)
+            .replace("\"schemaVersion\": 1", "\"schemaVersion\": 2")
+            .replace("\"provider\": {", "\"dialogueRetention\": {\"persistRawObservations\": false, \"maximumRawAgeDays\": 7, \"useInRecentContext\": false, \"useInCompaction\": true, \"useInRetrieval\": false},\n              \"provider\": {");
+        Files.writeString(global, v2, StandardCharsets.UTF_8);
+        EnabledWorldmindIntegration current = assertInstanceOf(EnabledWorldmindIntegration.class,
+            new WorldmindStartupConfigurationLoader(configurationDirectory, WorldmindTestkit.secretResolver()).load());
+        var retention = current.configuration().globalConfiguration().dialogueRetention();
+        assertFalse(retention.persistRawObservations());
+        assertEquals(7, retention.maximumRawAgeDays());
+        assertFalse(retention.useInRecentContext());
+        assertTrue(retention.useInCompaction());
+        assertFalse(retention.useInRetrieval());
+    }
+
+    @Test
     void rejectsUnknownFieldsAndNeverRewritesANewerSchema() throws IOException {
         writeProfile("oracle", "Aster", "Measured and curious.", "Never claim server authority.", "Speak calmly.", 280);
         String futureGlobal = """
             {
-              "schemaVersion": 2,
+              "schemaVersion": 3,
               "enabled": true,
               "activeProfile": "oracle",
               "chatBatching": {"maxMessages": 8, "maxWaitMillis": 5000, "maxEstimatedInputCharacters": 4000},

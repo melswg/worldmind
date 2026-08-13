@@ -9,6 +9,7 @@ import io.github.melswg.worldmind.core.configuration.ConfigurationDiagnostic;
 import io.github.melswg.worldmind.core.configuration.ChatNameColor;
 import io.github.melswg.worldmind.core.configuration.ChatBatchingConfiguration;
 import io.github.melswg.worldmind.core.configuration.DisabledWorldmindIntegration;
+import io.github.melswg.worldmind.core.configuration.DialogueRetentionConfiguration;
 import io.github.melswg.worldmind.core.configuration.EnabledWorldmindIntegration;
 import io.github.melswg.worldmind.core.configuration.ExternalSecretReference;
 import io.github.melswg.worldmind.core.configuration.GenerationParameters;
@@ -45,7 +46,7 @@ import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
- * Reads the strict, read-only v1 filesystem format at
+ * Reads strict v1 compatibility input and the current v2 filesystem format at
  * {@code config/worldmind}. JSON is confined to this Fabric adapter; core sees
  * only validated, JSON-library-independent values.
  */
@@ -55,13 +56,19 @@ public final class WorldmindStartupConfigurationLoader {
     private static final Pattern PROFILE_ID = Pattern.compile("[a-z0-9][a-z0-9-]{0,63}");
     private static final Pattern SECRET_REFERENCE = Pattern.compile("[a-z][a-z0-9-]{0,31}:[^\\s]+", Pattern.CASE_INSENSITIVE);
     private static final String CUSTOM_OPENAI_COMPATIBLE = "custom-openai-compatible";
-    private static final Set<String> GLOBAL_FIELDS = Set.of(
+    private static final Set<String> GLOBAL_FIELDS_V1 = Set.of(
         "schemaVersion",
         "enabled",
         "activeProfile",
         "provider",
         "chatBatching",
         "requestQueue"
+    );
+    private static final Set<String> GLOBAL_FIELDS_V2 = Set.of(
+        "schemaVersion", "enabled", "activeProfile", "provider", "chatBatching", "requestQueue", "dialogueRetention"
+    );
+    private static final Set<String> RETENTION_FIELDS = Set.of(
+        "persistRawObservations", "maximumRawAgeDays", "useInRecentContext", "useInCompaction", "useInRetrieval"
     );
     private static final Set<String> CHAT_BATCHING_FIELDS = Set.of(
         "maxMessages",
@@ -128,7 +135,8 @@ public final class WorldmindStartupConfigurationLoader {
                 global.circuitBreaker()
             ),
             global.chatBatching(),
-            global.requestQueue()
+            global.requestQueue(),
+            global.dialogueRetention()
         );
         WorldmindProfile worldmindProfile = new WorldmindProfile(
             profile.schemaVersion(),
@@ -185,23 +193,27 @@ public final class WorldmindStartupConfigurationLoader {
         if (global == null) {
             return null;
         }
-        rejectUnknownFields(global, "global", GLOBAL_FIELDS, diagnostics);
-
         Integer schemaVersion = requiredInteger(global, "schemaVersion", "global", diagnostics);
-        if (schemaVersion != null && schemaVersion != WorldmindGlobalConfiguration.V1_SCHEMA_VERSION) {
+        if (schemaVersion != null && schemaVersion != WorldmindGlobalConfiguration.V1_SCHEMA_VERSION
+            && schemaVersion != WorldmindGlobalConfiguration.V2_SCHEMA_VERSION) {
             diagnostic(
                 diagnostics,
                 "global.schemaVersion",
-                "must be exactly supported schema version " + WorldmindGlobalConfiguration.V1_SCHEMA_VERSION
+                "must be exactly supported schema version 1 or 2"
                     + "; found " + schemaVersion + "."
             );
         }
+        if (schemaVersion != null) rejectUnknownFields(global, "global",
+            schemaVersion == WorldmindGlobalConfiguration.V1_SCHEMA_VERSION ? GLOBAL_FIELDS_V1 : GLOBAL_FIELDS_V2, diagnostics);
         Boolean enabled = requiredBoolean(global, "enabled", "global", diagnostics);
         String activeProfile = requiredString(global, "activeProfile", "global", diagnostics);
         JsonObject chatBatching = requiredObject(global, "chatBatching", "global", diagnostics);
         ChatBatchingConfiguration batchingConfiguration = parseChatBatching(chatBatching, diagnostics);
         JsonObject requestQueue = requiredObject(global, "requestQueue", "global", diagnostics);
         RequestQueueConfiguration requestQueueConfiguration = parseRequestQueue(requestQueue, diagnostics);
+        DialogueRetentionConfiguration dialogueRetention = schemaVersion != null && schemaVersion == WorldmindGlobalConfiguration.V1_SCHEMA_VERSION
+            ? DialogueRetentionConfiguration.legacyDefaults()
+            : parseDialogueRetention(requiredObject(global, "dialogueRetention", "global", diagnostics), diagnostics);
 
         JsonObject provider = requiredObject(global, "provider", "global", diagnostics);
         if (provider == null) {
@@ -239,7 +251,7 @@ public final class WorldmindStartupConfigurationLoader {
         validateGenerationParameters(temperature, topP, maxOutputTokens, diagnostics);
 
         if (schemaVersion == null || enabled == null || activeProfile == null || batchingConfiguration == null || requestQueueConfiguration == null
-            || providerId == null || endpoint == null || model == null || secretReference == null || timeoutConfiguration == null || retryConfiguration == null || circuitBreakerConfiguration == null) {
+            || providerId == null || endpoint == null || model == null || secretReference == null || timeoutConfiguration == null || retryConfiguration == null || circuitBreakerConfiguration == null || dialogueRetention == null) {
             return null;
         }
         return new ParsedGlobal(
@@ -257,8 +269,25 @@ public final class WorldmindStartupConfigurationLoader {
             retryConfiguration,
             circuitBreakerConfiguration,
             batchingConfiguration,
-            requestQueueConfiguration
+            requestQueueConfiguration,
+            dialogueRetention
         );
+    }
+
+    private DialogueRetentionConfiguration parseDialogueRetention(JsonObject retention, List<ConfigurationDiagnostic> diagnostics) {
+        if (retention == null) return null;
+        rejectUnknownFields(retention, "global.dialogueRetention", RETENTION_FIELDS, diagnostics);
+        Boolean persist = requiredBoolean(retention, "persistRawObservations", "global.dialogueRetention", diagnostics);
+        Integer age = requiredInteger(retention, "maximumRawAgeDays", "global.dialogueRetention", diagnostics);
+        Boolean recent = requiredBoolean(retention, "useInRecentContext", "global.dialogueRetention", diagnostics);
+        Boolean compaction = requiredBoolean(retention, "useInCompaction", "global.dialogueRetention", diagnostics);
+        Boolean retrieval = requiredBoolean(retention, "useInRetrieval", "global.dialogueRetention", diagnostics);
+        if (age != null && (age < 0 || age > DialogueRetentionConfiguration.MAXIMUM_RAW_AGE_DAYS)) {
+            diagnostic(diagnostics, "global.dialogueRetention.maximumRawAgeDays", "must be an integer from 0 through 3650.");
+        }
+        if (persist == null || age == null || recent == null || compaction == null || retrieval == null
+            || age < 0 || age > DialogueRetentionConfiguration.MAXIMUM_RAW_AGE_DAYS) return null;
+        return new DialogueRetentionConfiguration(persist, age, recent, compaction, retrieval);
     }
 
     private ProviderCircuitBreakerConfiguration parseCircuitBreaker(JsonObject breaker, List<ConfigurationDiagnostic> diagnostics) {
@@ -823,7 +852,8 @@ public final class WorldmindStartupConfigurationLoader {
         ProviderRetryConfiguration retry,
         ProviderCircuitBreakerConfiguration circuitBreaker,
         ChatBatchingConfiguration chatBatching,
-        RequestQueueConfiguration requestQueue
+        RequestQueueConfiguration requestQueue,
+        DialogueRetentionConfiguration dialogueRetention
     ) {
     }
 

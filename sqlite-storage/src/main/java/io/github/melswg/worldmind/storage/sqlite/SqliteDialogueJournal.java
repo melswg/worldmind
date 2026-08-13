@@ -37,6 +37,9 @@ import io.github.melswg.worldmind.core.administration.MemoryDeletionRepository;
 import io.github.melswg.worldmind.core.administration.MemoryDeletionRequest;
 import io.github.melswg.worldmind.core.administration.MemoryDeletionResult;
 import io.github.melswg.worldmind.core.administration.AdministrationResultCode;
+import io.github.melswg.worldmind.core.administration.DialogueRetentionRepository;
+import io.github.melswg.worldmind.core.administration.RetentionSweepResult;
+import io.github.melswg.worldmind.core.configuration.DialogueRetentionConfiguration;
 import io.github.melswg.worldmind.core.memory.JournalSequenceRange;
 import io.github.melswg.worldmind.core.memory.CompactionSource;
 import io.github.melswg.worldmind.core.memory.CurrentSituationVersion;
@@ -112,7 +115,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * back into prompts, compaction, search, inspection or export.</p>
  */
 public final class SqliteDialogueJournal implements DialogueJournal, WorldMemoryRepository, MemoryCompactionRepository,
-    MemoryInspectionRepository, MemoryExportRepository, MemoryDeletionRepository {
+    MemoryInspectionRepository, MemoryExportRepository, MemoryDeletionRepository, DialogueRetentionRepository {
     public static final String DATABASE_FILE_NAME = "worldmind.sqlite3";
     public static final int SCHEMA_VERSION = 2;
     public static final int OLDEST_SUPPORTED_SCHEMA_VERSION = 1;
@@ -125,6 +128,7 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
     private final Connection connection;
     private final WorldIdentity worldIdentity;
     private final AtomicBoolean closing = new AtomicBoolean();
+    private volatile DialogueRetentionConfiguration retentionPolicy = DialogueRetentionConfiguration.legacyDefaults();
 
     private SqliteDialogueJournal(ExecutorService executor, Connection connection, WorldIdentity worldIdentity) {
         this.executor = executor;
@@ -179,27 +183,39 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
 
     @Override
     public CompletionStage<JournaledObservation> appendObservation(CapturedPublicChatMessage observation) {
+        return appendObservation(observation, retentionPolicy);
+    }
+
+    @Override
+    public CompletionStage<JournaledObservation> appendObservation(
+        CapturedPublicChatMessage observation, DialogueRetentionConfiguration retention
+    ) {
         Objects.requireNonNull(observation, "observation");
+        Objects.requireNonNull(retention, "retention");
         String redactedMessage = SecretRedactionPolicy.redact(observation.message());
         return submit(() -> {
-            String sql = "INSERT INTO journal_observations(player_uuid, captured_at_epoch_millis, source, visibility, addressing_signal, raw_state) VALUES (?, ?, ?, ?, ?, 'AVAILABLE')";
+            String state = retention.persistRawObservations() ? "AVAILABLE" : "NOT_PERSISTED";
+            String sql = "INSERT INTO journal_observations(player_uuid, captured_at_epoch_millis, source, visibility, addressing_signal, raw_state) VALUES (?, ?, ?, ?, ?, ?)";
             try (PreparedStatement statement = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
                 statement.setString(1, observation.requester().playerId().toString());
                 statement.setLong(2, observation.capturedAt().toEpochMilli());
                 statement.setString(3, JournalMessageSource.PUBLIC_CHAT.name());
                 statement.setString(4, JournalVisibility.PUBLIC.name());
                 statement.setString(5, observation.addressingSignal().name());
+                statement.setString(6, state);
                 statement.executeUpdate();
                 try (ResultSet keys = statement.getGeneratedKeys()) {
                     if (!keys.next()) throw new SQLException("SQLite did not return a journal sequence.");
                     long sequence = keys.getLong(1);
-                    try (PreparedStatement payload = connection.prepareStatement(
-                        "INSERT INTO journal_observation_payloads(sequence, player_name, message_text) VALUES (?, ?, ?)"
-                    )) {
-                        payload.setLong(1, sequence);
-                        payload.setString(2, observation.requester().playerName());
-                        payload.setString(3, redactedMessage);
-                        payload.executeUpdate();
+                    if (retention.persistRawObservations()) {
+                        try (PreparedStatement payload = connection.prepareStatement(
+                            "INSERT INTO journal_observation_payloads(sequence, player_name, message_text) VALUES (?, ?, ?)"
+                        )) {
+                            payload.setLong(1, sequence);
+                            payload.setString(2, observation.requester().playerName());
+                            payload.setString(3, redactedMessage);
+                            payload.executeUpdate();
+                        }
                     }
                     return new JournaledObservation(
                         worldIdentity, sequence, observation.requester(), redactedMessage, observation.capturedAt(),
@@ -208,6 +224,11 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
                 }
             }
         });
+    }
+
+    /** Installs policy atomically for new reads; physical expiration remains async. */
+    public void configureRetention(DialogueRetentionConfiguration policy) {
+        retentionPolicy = Objects.requireNonNull(policy, "policy");
     }
 
     @Override
@@ -302,6 +323,17 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
     public CompletionStage<MemoryExportPage> exportPage(MemoryExportQuery query) {
         Objects.requireNonNull(query, "query");
         return submit(() -> readExportPage(query));
+    }
+
+    @Override
+    public CompletionStage<RetentionSweepResult> sweepDialogueRetention(
+        DialogueRetentionConfiguration policy, Instant evaluatedAt
+    ) {
+        Objects.requireNonNull(policy, "policy");
+        Objects.requireNonNull(evaluatedAt, "evaluatedAt");
+        configureRetention(policy);
+        if (!policy.hasFiniteAge()) return CompletableFuture.completedFuture(RetentionSweepResult.idle());
+        return submit(() -> withTransaction(() -> expireRetentionPage(policy, evaluatedAt)));
     }
 
     @Override
@@ -441,7 +473,7 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
         long beforeSequence = nextBatch.messages().get(0).sequence();
         List<String> participants = nextBatch.messages().stream()
             .map(message -> message.requester().playerId().toString()).distinct().toList();
-        List<RetrievedMemoryEntry> recent = recentDialogue(beforeSequence);
+        List<RetrievedMemoryEntry> recent = retentionPolicy.useInRecentContext() ? recentDialogue(beforeSequence) : List.of();
         List<RetrievedMemoryEntry> situations = currentSituations(beforeSequence, participants);
         List<RankedSearchDocument> older = rankedOlderDocuments(nextBatch, beforeSequence, participants);
         return applyRetrievalBudget(recent, situations, older.stream().map(RankedSearchDocument::entry).toList());
@@ -517,6 +549,7 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
             try (ResultSet rows = statement.executeQuery()) {
                 while (rows.next()) {
                     SearchDocument document = searchDocument(rows);
+                    if (!retentionPolicy.useInRetrieval() && document.type == RetrievedMemoryRecordType.DIALOGUE) continue;
                     double relevance = 1.0 / (1.0 + Math.abs(rows.getDouble("bm25_score")));
                     double recency = Math.max(0.0, Math.min(1.0, 1.0 - ((double) (beforeSequence - document.range.lastSequence()) / 10_000.0)));
                     candidates.add(new RankedSearchDocument(retrievedEntry(document), 0.70 * relevance + 0.20 * recency
@@ -635,6 +668,7 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
             if (!worldIdentity.equals(requestedWorld)) {
                 throw new IllegalArgumentException("A compaction repository may only compact its own world.");
             }
+            if (!retentionPolicy.useInCompaction()) return Optional.empty();
             Long cutoff = sequenceBeforeRecentWorkingWindow();
             if (cutoff == null) return Optional.empty();
 
@@ -1038,6 +1072,92 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
     }
 
     private record DeletionClosure(java.util.Set<Long> observations, java.util.Set<String> batches, int affectedRecords, String fingerprint) { }
+
+    /** Expires at most 256 raw payloads at an inclusive UTC cutoff in one transaction. */
+    private RetentionSweepResult expireRetentionPage(DialogueRetentionConfiguration policy, Instant evaluatedAt) throws SQLException {
+        long cutoff = evaluatedAt.minus(java.time.Duration.ofDays(policy.maximumRawAgeDays())).toEpochMilli();
+        java.util.LinkedHashSet<Long> sequences = new java.util.LinkedHashSet<>();
+        try (PreparedStatement rows = connection.prepareStatement(
+            "SELECT sequence FROM journal_observations WHERE raw_state = 'AVAILABLE' AND captured_at_epoch_millis <= ? ORDER BY sequence LIMIT 257"
+        )) {
+            rows.setLong(1, cutoff);
+            try (ResultSet result = rows.executeQuery()) { while (result.next()) sequences.add(result.getLong(1)); }
+        }
+        boolean more = sequences.size() > 256;
+        if (more) sequences.remove(sequences.stream().skip(256).findFirst().orElseThrow());
+        if (sequences.isEmpty()) {
+            updateRetentionMetadata(evaluatedAt, "IDLE");
+            return RetentionSweepResult.idle();
+        }
+        java.util.LinkedHashSet<String> batches = new java.util.LinkedHashSet<>();
+        for (Long sequence : sequences) {
+            try (PreparedStatement members = connection.prepareStatement("SELECT batch_id FROM journal_batch_messages WHERE message_sequence = ?")) {
+                members.setLong(1, sequence);
+                try (ResultSet result = members.executeQuery()) { while (result.next()) batches.add(result.getString(1)); }
+            }
+        }
+        deletePayloads(sequences);
+        markRawUnavailableForRetention(sequences, evaluatedAt);
+        if (!batches.isEmpty()) {
+            updateIn("UPDATE journal_batches SET source_state = 'RAW_UNAVAILABLE' WHERE source_state = 'AVAILABLE' AND batch_id IN (", batches);
+            updateDerivedAvailability(batches, "RAW_UNAVAILABLE");
+            try (PreparedStatement coverage = connection.prepareStatement("INSERT OR REPLACE INTO memory_compaction_batch_coverage(batch_id, coverage_state, recorded_at_epoch_millis) VALUES (?, 'SKIPPED_UNAVAILABLE', ?)")) {
+                for (String batch : batches) { coverage.setString(1, batch); coverage.setLong(2, evaluatedAt.toEpochMilli()); coverage.addBatch(); }
+                coverage.executeBatch();
+            }
+        }
+        rebuildSearchDocuments(connection);
+        incrementContentRevision();
+        updateRetentionMetadata(evaluatedAt, more ? "SCHEDULED" : "IDLE");
+        return new RetentionSweepResult(AdministrationResultCode.SUCCESS, sequences.size(), more);
+    }
+
+    private void markRawUnavailableForRetention(java.util.Set<Long> sequences, Instant at) throws SQLException {
+        String sql = "UPDATE journal_observations SET raw_state = 'EXPIRED', raw_unavailable_at_epoch_millis = ? WHERE sequence IN (" + placeholders(sequences.size()) + ")";
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setLong(1, at.toEpochMilli());
+            int parameter = 2;
+            for (Long sequence : sequences) statement.setLong(parameter++, sequence);
+            statement.executeUpdate();
+        }
+    }
+
+    private void updateDerivedAvailability(java.util.Set<String> batchIds, String availability) throws SQLException {
+        String sources = "SELECT record_kind, record_id FROM memory_derived_sources WHERE batch_id IN (" + placeholders(batchIds.size()) + ")";
+        java.util.Map<String, java.util.LinkedHashSet<String>> ids = new java.util.LinkedHashMap<>();
+        try (PreparedStatement rows = connection.prepareStatement(sources)) {
+            bindStrings(rows, 1, batchIds);
+            try (ResultSet result = rows.executeQuery()) { while (result.next()) ids.computeIfAbsent(result.getString(1), ignored -> new java.util.LinkedHashSet<>()).add(result.getString(2)); }
+        }
+        for (Map.Entry<String, java.util.LinkedHashSet<String>> entry : ids.entrySet()) {
+            String table = switch (entry.getKey()) {
+                case "EVENT" -> "memory_events";
+                case "SUMMARY" -> "memory_summary_versions";
+                case "CURRENT_SITUATION" -> "memory_current_situation_versions";
+                default -> throw new SQLException("Unknown derived source kind.");
+            };
+            String column = switch (entry.getKey()) {
+                case "EVENT" -> "event_id";
+                case "SUMMARY" -> "summary_version_id";
+                case "CURRENT_SITUATION" -> "situation_version_id";
+                default -> throw new SQLException("Unknown derived source kind.");
+            };
+            try (PreparedStatement update = connection.prepareStatement("UPDATE " + table + " SET provenance_availability = ? WHERE " + column + " IN (" + placeholders(entry.getValue().size()) + ")")) {
+                update.setString(1, availability);
+                bindValues(update, 2, entry.getValue());
+                update.executeUpdate();
+            }
+        }
+        try (PreparedStatement records = connection.prepareStatement("UPDATE memory_records SET provenance_availability = ? WHERE source_batch_id IN (" + placeholders(batchIds.size()) + ")")) {
+            records.setString(1, availability); bindStrings(records, 2, batchIds); records.executeUpdate();
+        }
+    }
+
+    private void updateRetentionMetadata(Instant evaluatedAt, String result) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement("UPDATE retention_maintenance SET last_sweep_at_epoch_millis = ?, last_result = ? WHERE singleton = 1")) {
+            statement.setLong(1, evaluatedAt.toEpochMilli()); statement.setString(2, result); statement.executeUpdate();
+        }
+    }
 
     private InspectionSql inspectionSelect(MemoryRecordType type, MemoryInspectionScope scope) {
         return switch (type) {

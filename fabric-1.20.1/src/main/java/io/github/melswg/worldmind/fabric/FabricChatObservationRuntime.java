@@ -243,7 +243,7 @@ final class FabricChatObservationRuntime implements AutoCloseable {
         if (!active.get() || !ownedWorld.equals(worldIdentity)) {
             return ChatBatchAdmission.IGNORED_AFTER_CLOSE;
         }
-        journal.appendObservation(captured).whenComplete((observation, failure) -> serverScheduler.execute(() -> {
+        journal.appendObservation(captured, configuration.globalConfiguration().dialogueRetention()).whenComplete((observation, failure) -> serverScheduler.execute(() -> {
             if (!active.get()) {
                 return;
             }
