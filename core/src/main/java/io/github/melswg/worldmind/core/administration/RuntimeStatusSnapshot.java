@@ -22,7 +22,8 @@ public record RuntimeStatusSnapshot(
     WorkStatus work,
     Optional<ProviderCircuitSnapshot> circuit,
     StorageHealth storage,
-    CompactionStatus compaction
+    CompactionStatus compaction,
+    Optional<GameContextExtensionStatus> gameContextExtensions
 ) {
     public RuntimeStatusSnapshot {
         Objects.requireNonNull(lifecycle, "lifecycle");
@@ -36,6 +37,7 @@ public record RuntimeStatusSnapshot(
         circuit = optional(circuit, "circuit");
         Objects.requireNonNull(storage, "storage");
         Objects.requireNonNull(compaction, "compaction");
+        gameContextExtensions = Optional.ofNullable(Objects.requireNonNull(gameContextExtensions, "gameContextExtensions").orElse(null));
         if (integrationEnabled && disableReason.isPresent()) {
             throw new IllegalArgumentException("Enabled integration has no disable reason.");
         }
@@ -49,7 +51,7 @@ public record RuntimeStatusSnapshot(
         Optional<ProviderCircuitSnapshot> circuit, StorageHealth storage, CompactionStatus compaction
     ) {
         this(lifecycle, reload, integrationEnabled, disableReason, activeProfile, Optional.empty(), providerAvailability,
-            batching, work, circuit, storage, compaction);
+            batching, work, circuit, storage, compaction, Optional.empty());
     }
 
     private static <T> Optional<T> optional(Optional<T> value, String name) {

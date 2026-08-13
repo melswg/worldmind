@@ -200,12 +200,24 @@ public final class PromptBudgetPolicy {
         List<PromptLayer> layers = new ArrayList<>(request.promptLayers().size());
         for (PromptLayer layer : request.promptLayers()) {
             if (layer.type() == type && !layer.fragments().isEmpty()) {
-                layers.add(new PromptLayer(layer.type(), layer.trust(), layer.fragments().subList(1, layer.fragments().size())));
+                int removalIndex = type == PromptLayerType.CURRENT_GAME_CONTEXT
+                    ? firstExtensionFragment(layer.fragments()) : 0;
+                if (removalIndex < 0) removalIndex = 0;
+                List<PromptFragment> retained = new ArrayList<>(layer.fragments());
+                retained.remove(removalIndex);
+                layers.add(new PromptLayer(layer.type(), layer.trust(), retained));
             } else {
                 layers.add(layer);
             }
         }
         return new ProviderRequest(request.model(), request.generationParameters(), layers);
+    }
+
+    private static int firstExtensionFragment(List<PromptFragment> fragments) {
+        for (int index = 0; index < fragments.size(); index++) {
+            if (fragments.get(index).source().startsWith("extension-game-context:")) return index;
+        }
+        return -1;
     }
 
     private static ProviderRequest replaceNewestChatFragment(ProviderRequest request, PromptFragment replacement) {

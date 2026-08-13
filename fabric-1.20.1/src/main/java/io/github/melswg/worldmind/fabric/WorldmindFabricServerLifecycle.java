@@ -23,6 +23,7 @@ import io.github.melswg.worldmind.core.administration.ReloadResult;
 import io.github.melswg.worldmind.core.administration.RuntimeLifecycleState;
 import io.github.melswg.worldmind.core.administration.RuntimeReloadState;
 import io.github.melswg.worldmind.core.administration.RuntimeStatusSnapshot;
+import io.github.melswg.worldmind.core.administration.GameContextExtensionStatus;
 import io.github.melswg.worldmind.core.administration.StorageHealth;
 import io.github.melswg.worldmind.core.administration.WorkStatus;
 import io.github.melswg.worldmind.core.administration.WorldmindAdministration;
@@ -260,6 +261,8 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
             ? Optional.empty()
             : Optional.ofNullable(observation.circuitStatus());
         Optional<CompactionStatus> compaction = observation == null ? Optional.empty() : Optional.of(observation.compactionStatus());
+        Optional<GameContextExtensionStatus> extensions = gameContextRuntime == null
+            ? Optional.empty() : Optional.of(extensionStatus(gameContextRuntime.snapshot()));
         EnabledWorldmindIntegration enabled = integrationState instanceof EnabledWorldmindIntegration value ? value : null;
         Optional<IntegrationDisableReason> disableReason = integrationState instanceof DisabledWorldmindIntegration disabled
             ? Optional.of(disabled.reason()) : Optional.empty();
@@ -275,7 +278,21 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
             work.orElse(new WorkStatus(0, 0, lifecycleState == RuntimeLifecycleState.STOPPED, 0, 0)),
             circuit,
             storageHealth,
-            compaction.orElse(new CompactionStatus(0, 0, "NONE"))
+            compaction.orElse(new CompactionStatus(0, 0, "NONE")),
+            extensions
+        );
+    }
+
+    private static GameContextExtensionStatus extensionStatus(
+        io.github.melswg.worldmind.gamecontext.internal.GameContextRuntimeSnapshot snapshot
+    ) {
+        return new GameContextExtensionStatus(
+            snapshot.registered(),
+            snapshot.active(),
+            snapshot.quarantined(),
+            snapshot.inFlight(),
+            snapshot.latestDiagnostic().map(value -> value.source().canonicalName()),
+            snapshot.latestDiagnostic().map(value -> value.code().name())
         );
     }
 

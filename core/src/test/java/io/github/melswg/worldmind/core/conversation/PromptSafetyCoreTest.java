@@ -63,6 +63,30 @@ class PromptSafetyCoreTest {
     }
 
     @Test
+    void evictsExtensionGameContextBeforeVanillaContextWithoutTouchingTrustedFloor() {
+        ProviderRequest selected = PromptBudgetPolicy.select(
+            "example-model",
+            new GenerationParameters(Optional.empty(), Optional.empty(), Optional.empty()),
+            List.of(
+                trusted(PromptLayerType.BUILT_IN_SAFETY_POLICY, "built-in", "required safety"),
+                trusted(PromptLayerType.ADMINISTRATOR_RULES, "administrator", "A".repeat(9_200)),
+                trusted(PromptLayerType.PERSONA, "persona", "calm guide"),
+                new PromptLayer(PromptLayerType.LORE, PromptTrust.UNTRUSTED_DATA, List.of()),
+                new PromptLayer(PromptLayerType.MEMORY, PromptTrust.UNTRUSTED_DATA, List.of()),
+                new PromptLayer(PromptLayerType.CURRENT_GAME_CONTEXT, PromptTrust.UNTRUSTED_DATA, List.of(
+                    new PromptFragment("vanilla-game-context", "v".repeat(1_000)),
+                    new PromptFragment("extension-game-context:example:season#state", "e".repeat(1_000))
+                )),
+                untrusted(PromptLayerType.CURRENT_CHAT_BATCH, "public-chat-message.sequence-1", "Aster!")
+            )
+        ).orElseThrow();
+
+        assertEquals(List.of("vanilla-game-context"), layer(selected, PromptLayerType.CURRENT_GAME_CONTEXT).fragments()
+            .stream().map(PromptFragment::source).toList());
+        assertEquals(PromptTrust.TRUSTED_INSTRUCTION, layer(selected, PromptLayerType.ADMINISTRATOR_RULES).trust());
+    }
+
+    @Test
     void decodesExactlyOnceThenReturnsOnlyAUnicodeSafeLiteralBody() {
         ConversationOutcome nestedDecision = ParticipationProtocol.decode(
             "DIRECT_REPLY\nhello\r\nSILENT\nDIRECT_REPLY",

@@ -1,6 +1,7 @@
 package io.github.melswg.worldmind.testkit;
 
 import io.github.melswg.worldmind.core.conversation.ConversationApplicationService;
+import io.github.melswg.worldmind.core.conversation.CurrentGameContextResolver;
 import io.github.melswg.worldmind.core.conversation.ConversationOutcome;
 import io.github.melswg.worldmind.core.conversation.ConversationRefusal;
 import io.github.melswg.worldmind.core.conversation.ChatBatchCoordinator;
@@ -40,11 +41,21 @@ public final class WorldmindAcceptanceScenario {
     }
 
     public WorldmindAcceptanceScenario(LanguageModel languageModel, WorldMemoryRepository memoryRepository) {
+        this(languageModel, memoryRepository, CurrentGameContextResolver.vanillaOnly());
+    }
+
+    /** Allows acceptance tests to exercise a bounded source-attributed current-context resolver. */
+    public WorldmindAcceptanceScenario(
+        LanguageModel languageModel,
+        WorldMemoryRepository memoryRepository,
+        CurrentGameContextResolver currentGameContextResolver
+    ) {
         this.languageModel = java.util.Objects.requireNonNull(languageModel, "languageModel");
         this.applicationService = new ConversationApplicationService(
             this.languageModel,
             serverScheduler,
-            java.util.Objects.requireNonNull(memoryRepository, "memoryRepository")
+            java.util.Objects.requireNonNull(memoryRepository, "memoryRepository"),
+            java.util.Objects.requireNonNull(currentGameContextResolver, "currentGameContextResolver")
         );
     }
 

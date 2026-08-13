@@ -14,6 +14,10 @@ final class WorldmindCommandText {
         String circuit = status.circuit().map(value -> " circuit=" + value.state() + " failures="
             + value.consecutiveQualifyingFailures() + " cooldown=" + (value.cooldownUntil().isPresent() ? "active" : "none")
             + " probe=" + value.probeInFlight()).orElse(" circuit=unavailable");
+        String extensions = status.gameContextExtensions().map(value -> " extensions=" + value.active() + "/"
+            + value.registered() + " quarantined=" + value.quarantined() + " inFlight=" + value.inFlight()
+            + value.latestProvider().map(provider -> " last=" + provider + ":" + value.latestDiagnosticCode().orElse("none")).orElse("")
+        ).orElse(" extensions=unavailable");
         return "Worldmind lifecycle=" + status.lifecycle()
             + " reload=" + status.reload()
             + " integration=" + (status.integrationEnabled() ? "ENABLED" : "DISABLED")
@@ -23,7 +27,7 @@ final class WorldmindCommandText {
             + " provider=" + status.providerAvailability()
             + " queue=" + status.work().queued() + "/" + status.work().inFlight() + "/" + status.work().closed()
             + " retry=" + status.work().retryAttempts() + "/" + status.work().waitingBackoff()
-            + batching + circuit
+            + batching + circuit + extensions
             + " storage=" + status.storage()
             + " compaction=" + status.compaction().queued() + "/" + status.compaction().inFlight() + "/" + status.compaction().lastOutcome();
     }

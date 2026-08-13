@@ -31,6 +31,10 @@ public final class GameContextRegistrationCatalog {
         return List.copyOf(registrations.values());
     }
 
+    public synchronized List<RegisteredProvider> providers() {
+        return List.copyOf(registrations.values());
+    }
+
     public void closeAll() {
         List<RegisteredProvider> retired;
         synchronized (this) {
@@ -84,6 +88,9 @@ public final class GameContextRegistrationCatalog {
         private final GameContextSource source;
         private final GameContextProvider provider;
         private boolean active = true;
+        private boolean quarantined;
+        private boolean inFlight;
+        private boolean abandonedWorker;
 
         private RegisteredProvider(GameContextSource source, GameContextProvider provider) {
             this.source = source;
@@ -104,6 +111,36 @@ public final class GameContextRegistrationCatalog {
 
         synchronized void deactivate() {
             active = false;
+        }
+
+        synchronized boolean beginInvocation(boolean cleanup) {
+            if ((!cleanup && (!active || quarantined)) || inFlight) return false;
+            inFlight = true;
+            return true;
+        }
+
+        synchronized void finishInvocation() {
+            inFlight = false;
+        }
+
+        synchronized void quarantine() {
+            quarantined = true;
+        }
+
+        synchronized boolean quarantined() {
+            return quarantined;
+        }
+
+        synchronized boolean inFlight() {
+            return inFlight;
+        }
+
+        synchronized void markAbandonedWorker() {
+            abandonedWorker = true;
+        }
+
+        synchronized boolean abandonedWorker() {
+            return abandonedWorker;
         }
     }
 

@@ -1,6 +1,7 @@
 package io.github.melswg.worldmind.testkit;
 
 import io.github.melswg.worldmind.core.conversation.LanguageModel;
+import io.github.melswg.worldmind.core.conversation.CurrentGameContextResolver;
 import io.github.melswg.worldmind.core.memory.WorldMemoryRepository;
 
 /** Entry point for the reusable deterministic Worldmind acceptance seam. */
@@ -18,6 +19,14 @@ public final class WorldmindTestkit {
 
     public static WorldmindAcceptanceScenario scenario(LanguageModel languageModel, WorldMemoryRepository memoryRepository) {
         return new WorldmindAcceptanceScenario(languageModel, memoryRepository);
+    }
+
+    public static WorldmindAcceptanceScenario scenario(
+        LanguageModel languageModel,
+        WorldMemoryRepository memoryRepository,
+        CurrentGameContextResolver currentGameContextResolver
+    ) {
+        return new WorldmindAcceptanceScenario(languageModel, memoryRepository, currentGameContextResolver);
     }
 
     public static FakeSecretResolver secretResolver() {
