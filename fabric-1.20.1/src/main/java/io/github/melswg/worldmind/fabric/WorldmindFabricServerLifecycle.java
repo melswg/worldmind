@@ -254,7 +254,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
 
     @Override
     public CompletionStage<ConfigurationValidationReport> validate() {
-        return loadAsync().thenApply(ConfigurationValidationReport::fromIntegrationState);
+        return loadAsync(false).thenApply(ConfigurationValidationReport::fromIntegrationState);
     }
 
     @Override
@@ -426,7 +426,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
             reloadState = RuntimeReloadState.VALIDATING;
         }
         CompletableFuture<ReloadResult> result = new CompletableFuture<>();
-        loadAsync().whenComplete((candidate, failure) -> schedule(reloadServer, invocationGeneration, () -> {
+        loadAsync(true).whenComplete((candidate, failure) -> schedule(reloadServer, invocationGeneration, () -> {
             if (failure != null || candidate == null) {
                 completeReload(result, ReloadResult.of(AdministrationResultCode.INVALID_CANDIDATE));
                 return;
@@ -584,7 +584,11 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
     }
 
     private CompletionStage<WorldmindIntegrationState> loadAsync() {
-        return CompletableFuture.supplyAsync(this::loadConfiguration, administrationExecutor);
+        return loadAsync(true);
+    }
+
+    private CompletionStage<WorldmindIntegrationState> loadAsync(boolean migrate) {
+        return CompletableFuture.supplyAsync(() -> loadConfiguration(migrate), administrationExecutor);
     }
 
     /** Applies use-gates immediately; finite expiry is paged on non-server workers. */
@@ -608,8 +612,12 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
     }
 
     private WorldmindIntegrationState loadConfiguration() {
+        return loadConfiguration(true);
+    }
+
+    private WorldmindIntegrationState loadConfiguration(boolean migrate) {
         try {
-            return configurationLoader.load();
+            return migrate ? configurationLoader.loadAndMigrate() : configurationLoader.load();
         } catch (RuntimeException failure) {
             LOGGER.warn("Worldmind configuration loading failed: {}.", failure.getClass().getSimpleName());
             return failedState();

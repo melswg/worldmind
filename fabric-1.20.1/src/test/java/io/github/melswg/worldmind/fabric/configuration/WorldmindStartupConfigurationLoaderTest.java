@@ -143,6 +143,27 @@ class WorldmindStartupConfigurationLoaderTest {
     }
 
     @Test
+    void migratesValidatedV1GlobalToV2AfterPublishingABackupWhileReadOnlyLoadDoesNotRewrite() throws Exception {
+        writeProfile("oracle", "Aster", "Measured and curious.", "Never claim server authority.", "Speak calmly.", 280);
+        writeGlobal(true, "oracle", "{}", "env:WORLDMIND_TEST_KEY");
+        Path global = configurationDirectory.resolve("worldmind.json");
+        String v1 = Files.readString(global, StandardCharsets.UTF_8);
+        WorldmindStartupConfigurationLoader loader = new WorldmindStartupConfigurationLoader(configurationDirectory, WorldmindTestkit.secretResolver());
+        assertInstanceOf(EnabledWorldmindIntegration.class, loader.load());
+        assertEquals(v1, Files.readString(global, StandardCharsets.UTF_8));
+
+        assertInstanceOf(EnabledWorldmindIntegration.class, loader.loadAndMigrate());
+        String v2 = Files.readString(global, StandardCharsets.UTF_8);
+        assertTrue(v2.contains("\"schemaVersion\":2"));
+        assertTrue(v2.contains("\"dialogueRetention\""));
+        Path backups = configurationDirectory.resolve("backups/config");
+        assertTrue(Files.list(backups).anyMatch(Files::isDirectory));
+        assertFalse(Files.walk(backups).filter(Files::isRegularFile).map(path -> {
+            try { return Files.readString(path, StandardCharsets.UTF_8); } catch (IOException failure) { throw new RuntimeException(failure); }
+        }).anyMatch(value -> value.contains("WORLDMIND_REAL_SECRET_CANARY")));
+    }
+
+    @Test
     void rejectsUnknownFieldsAndNeverRewritesANewerSchema() throws IOException {
         writeProfile("oracle", "Aster", "Measured and curious.", "Never claim server authority.", "Speak calmly.", 280);
         String futureGlobal = """

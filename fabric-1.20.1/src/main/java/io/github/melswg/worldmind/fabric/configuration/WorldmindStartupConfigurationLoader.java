@@ -35,14 +35,22 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.nio.channels.FileChannel;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.regex.Pattern;
 
 /**
@@ -186,6 +194,108 @@ public final class WorldmindStartupConfigurationLoader {
         }
 
         return new EnabledWorldmindIntegration(validated);
+    }
+
+    /**
+     * Startup/reload-only v1→v2 upgrade. It validates the old bundle first,
+     * publishes a CREATE_NEW backup, then atomically replaces only the global
+     * JSON. Profiles are independently versioned and remain v1 today.
+     */
+    public WorldmindIntegrationState loadAndMigrate() {
+        MigrationCandidate candidate = migrationCandidate();
+        if (candidate == null) return load();
+        WorldmindIntegrationState validated = load();
+        if (!(validated instanceof EnabledWorldmindIntegration) && !(validated instanceof DisabledWorldmindIntegration disabled
+            && disabled.reason() == IntegrationDisableReason.DISABLED_BY_OPERATOR)) return validated;
+        try {
+            publishMigration(candidate);
+        } catch (IOException | RuntimeException failure) {
+            return disabled(IntegrationDisableReason.INVALID_CONFIGURATION,
+                List.of(new ConfigurationDiagnostic("global.schemaVersion", "configuration migration could not be completed safely.")));
+        }
+        return load();
+    }
+
+    private MigrationCandidate migrationCandidate() {
+        Path global = configurationDirectory.resolve(GLOBAL_FILE_NAME);
+        try (Reader reader = Files.newBufferedReader(global, StandardCharsets.UTF_8)) {
+            JsonElement parsed = JsonParser.parseReader(reader);
+            if (!parsed.isJsonObject()) return null;
+            JsonObject source = parsed.getAsJsonObject();
+            JsonElement version = source.get("schemaVersion");
+            if (!isNumber(version) || version.getAsInt() != WorldmindGlobalConfiguration.V1_SCHEMA_VERSION) return null;
+            String activeProfile = isString(source.get("activeProfile")) ? source.get("activeProfile").getAsString() : null;
+            if (activeProfile == null || !PROFILE_ID.matcher(activeProfile).matches()) return null;
+            Path profile = configurationDirectory.resolve("profiles").resolve(activeProfile).resolve(PROFILE_FILE_NAME);
+            JsonObject target = source.deepCopy();
+            target.addProperty("schemaVersion", WorldmindGlobalConfiguration.V2_SCHEMA_VERSION);
+            JsonObject retention = new JsonObject();
+            retention.addProperty("persistRawObservations", true);
+            retention.addProperty("maximumRawAgeDays", 0);
+            retention.addProperty("useInRecentContext", true);
+            retention.addProperty("useInCompaction", true);
+            retention.addProperty("useInRetrieval", true);
+            target.add("dialogueRetention", retention);
+            return new MigrationCandidate(global, profile, Files.readAllBytes(global), Files.readAllBytes(profile), target.toString());
+        } catch (IOException | RuntimeException invalid) {
+            return null;
+        }
+    }
+
+    private void publishMigration(MigrationCandidate candidate) throws IOException {
+        Path root = configurationDirectory.toAbsolutePath().normalize();
+        if (Files.isSymbolicLink(root)) throw new IOException("Unsafe configuration root.");
+        Path backupRoot = safeDescendant(root, root.resolve("backups").resolve("config"));
+        Files.createDirectories(backupRoot);
+        if (Files.isSymbolicLink(backupRoot)) throw new IOException("Unsafe configuration backup root.");
+        String id = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC).format(Instant.now()) + "-" + UUID.randomUUID();
+        Path temporaryBackup = backupRoot.resolve("." + id + ".tmp");
+        Path backup = backupRoot.resolve(id);
+        if (Files.exists(temporaryBackup) || Files.exists(backup)) throw new IOException("Configuration backup collision.");
+        Files.createDirectory(temporaryBackup);
+        boolean published = false;
+        try {
+            Path backupGlobal = temporaryBackup.resolve(GLOBAL_FILE_NAME);
+            Path profileDir = temporaryBackup.resolve("profiles").resolve(candidate.profile().getParent().getFileName());
+            Files.createDirectories(profileDir);
+            Path backupProfile = profileDir.resolve(PROFILE_FILE_NAME);
+            writeNew(backupGlobal, candidate.globalBytes());
+            writeNew(backupProfile, candidate.profileBytes());
+            String manifest = "{\"backupId\":\"" + id + "\",\"globalSha256\":\"" + sha256(candidate.globalBytes())
+                + "\",\"profileSha256\":\"" + sha256(candidate.profileBytes()) + "\"}";
+            writeNew(temporaryBackup.resolve("manifest.json"), manifest.getBytes(StandardCharsets.UTF_8));
+            try { Files.move(temporaryBackup, backup, StandardCopyOption.ATOMIC_MOVE); }
+            catch (AtomicMoveNotSupportedException unavailable) { throw new IOException("Atomic backup publication is unavailable.", unavailable); }
+            published = true;
+            Path replacement = candidate.global().resolveSibling("." + GLOBAL_FILE_NAME + "." + id + ".tmp");
+            writeNew(replacement, candidate.targetJson().getBytes(StandardCharsets.UTF_8));
+            try { Files.move(replacement, candidate.global(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING); }
+            catch (AtomicMoveNotSupportedException unavailable) { throw new IOException("Atomic configuration replacement is unavailable.", unavailable); }
+        } finally {
+            if (!published) deleteDirectoryIfEmpty(temporaryBackup);
+        }
+    }
+
+    private static Path safeDescendant(Path root, Path candidate) throws IOException {
+        Path normalized = candidate.toAbsolutePath().normalize();
+        if (!normalized.startsWith(root)) throw new IOException("Unsafe configuration path.");
+        return normalized;
+    }
+
+    private static void writeNew(Path target, byte[] bytes) throws IOException {
+        try (FileChannel channel = FileChannel.open(target, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+            channel.write(java.nio.ByteBuffer.wrap(bytes));
+            channel.force(true);
+        }
+    }
+
+    private static String sha256(byte[] bytes) {
+        try { return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(bytes)); }
+        catch (java.security.NoSuchAlgorithmException impossible) { throw new IllegalStateException(impossible); }
+    }
+
+    private static void deleteDirectoryIfEmpty(Path path) {
+        try { Files.deleteIfExists(path); } catch (IOException ignored) { }
     }
 
     private ParsedGlobal parseGlobal(Path globalFile, List<ConfigurationDiagnostic> diagnostics) {
@@ -867,5 +977,12 @@ public final class WorldmindStartupConfigurationLoader {
         int responseLengthLimit,
         ChatNameColor chatNameColor
     ) {
+    }
+
+    private record MigrationCandidate(Path global, Path profile, byte[] globalBytes, byte[] profileBytes, String targetJson) {
+        private MigrationCandidate {
+            globalBytes = globalBytes.clone();
+            profileBytes = profileBytes.clone();
+        }
     }
 }
