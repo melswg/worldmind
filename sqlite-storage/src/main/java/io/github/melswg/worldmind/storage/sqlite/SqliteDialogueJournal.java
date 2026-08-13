@@ -19,6 +19,16 @@ import io.github.melswg.worldmind.core.journal.JournaledBatch;
 import io.github.melswg.worldmind.core.journal.JournaledObservation;
 import io.github.melswg.worldmind.core.journal.ProviderAttemptOutcome;
 import io.github.melswg.worldmind.core.memory.JournalSequenceRange;
+import io.github.melswg.worldmind.core.memory.CompactionSource;
+import io.github.melswg.worldmind.core.memory.CurrentSituationVersion;
+import io.github.melswg.worldmind.core.memory.DerivedMemoryCandidate;
+import io.github.melswg.worldmind.core.memory.DerivedMemoryProvenance;
+import io.github.melswg.worldmind.core.memory.MemoryChunkSummary;
+import io.github.melswg.worldmind.core.memory.MemoryCompactionInput;
+import io.github.melswg.worldmind.core.memory.MemoryCompactionRepository;
+import io.github.melswg.worldmind.core.memory.MemoryCompactionResult;
+import io.github.melswg.worldmind.core.memory.MemoryCompactionSnapshot;
+import io.github.melswg.worldmind.core.memory.MemoryEvent;
 import io.github.melswg.worldmind.core.memory.MemoryConfirmation;
 import io.github.melswg.worldmind.core.memory.MemoryConfirmationRequest;
 import io.github.melswg.worldmind.core.memory.MemoryConfidence;
@@ -62,9 +72,13 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /** SQLite schema-v1 journal. Every JDBC action is serialized on one private worker thread. */
-public final class SqliteDialogueJournal implements DialogueJournal, WorldMemoryRepository {
+public final class SqliteDialogueJournal implements DialogueJournal, WorldMemoryRepository, MemoryCompactionRepository {
     public static final String DATABASE_FILE_NAME = "worldmind.sqlite3";
     private static final int SCHEMA_VERSION = 1;
+    private static final int RECENT_WORKING_OBSERVATIONS = 24;
+    private static final int MAX_COMPACTION_BATCHES = 8;
+    private static final int MAX_COMPACTION_MESSAGES = 32;
+    private static final int MAX_COMPACTION_CODE_POINTS = 12_000;
 
     private final ExecutorService executor;
     private final Connection connection;
@@ -325,6 +339,103 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
     }
 
     @Override
+    public CompletionStage<Optional<MemoryCompactionInput>> nextCompaction(WorldIdentity requestedWorld) {
+        Objects.requireNonNull(requestedWorld, "requestedWorld");
+        return submit(() -> {
+            if (!worldIdentity.equals(requestedWorld)) {
+                throw new IllegalArgumentException("A compaction repository may only compact its own world.");
+            }
+            Long cutoff = sequenceBeforeRecentWorkingWindow();
+            if (cutoff == null) return Optional.empty();
+
+            Map<UUID, JournalBatchOutcome> outcomes = readOutcomes();
+            List<JournaledBatch> completed = readBatches().stream()
+                .filter(batch -> batch.lastSequence() <= cutoff && outcomes.containsKey(batch.batchId()))
+                .toList();
+            for (int start = 0; start < completed.size(); start++) {
+                List<JournaledBatch> selected = new ArrayList<>();
+                long expectedFirst = -1;
+                int messageCount = 0;
+                int sourceCodePoints = 0;
+                for (int index = start; index < completed.size() && selected.size() < MAX_COMPACTION_BATCHES; index++) {
+                    JournaledBatch batch = completed.get(index);
+                    if (isCompactionRangeCovered(new JournalSequenceRange(batch.firstSequence(), batch.lastSequence()))) {
+                        break;
+                    }
+                    if (expectedFirst != -1 && batch.firstSequence() != expectedFirst) break;
+                    int nextMessageCount = messageCount + batch.messageSequences().size();
+                    if (nextMessageCount > MAX_COMPACTION_MESSAGES) break;
+                    List<CompactionSource> batchSources = readCompactionSources(batch.firstSequence(), batch.lastSequence());
+                    if (batchSources.size() != batch.messageSequences().size()) break;
+                    int nextCodePoints = sourceCodePoints + batchSources.stream()
+                        .mapToInt(source -> source.text().codePointCount(0, source.text().length())).sum();
+                    if (nextCodePoints > MAX_COMPACTION_CODE_POINTS) break;
+                    selected.add(batch);
+                    messageCount = nextMessageCount;
+                    sourceCodePoints = nextCodePoints;
+                    expectedFirst = batch.lastSequence() + 1;
+                }
+                if (!selected.isEmpty()) {
+                    long first = selected.get(0).firstSequence();
+                    long last = selected.get(selected.size() - 1).lastSequence();
+                    List<CompactionSource> sources = readCompactionSources(first, last);
+                    if (sources.size() == last - first + 1) {
+                        return Optional.of(new MemoryCompactionInput(
+                            worldIdentity,
+                            new DerivedMemoryProvenance(new JournalSequenceRange(first, last), selected.stream().map(JournaledBatch::batchId).toList()),
+                            sources
+                        ));
+                    }
+                }
+            }
+            return Optional.empty();
+        });
+    }
+
+    @Override
+    public CompletionStage<MemoryCompactionSnapshot> persistCompaction(
+        MemoryCompactionInput input,
+        MemoryCompactionResult result
+    ) {
+        Objects.requireNonNull(input, "input");
+        Objects.requireNonNull(result, "result");
+        return submit(() -> {
+            if (!worldIdentity.equals(input.worldIdentity())) {
+                throw new IllegalArgumentException("A compaction repository may only persist its own world.");
+            }
+            validateCompactionResult(result);
+            return withTransaction(() -> {
+                validatePersistedCompactionInput(input);
+                Instant sourceTimestamp = input.sources().get(input.sources().size() - 1).capturedAt();
+                Instant recordedAt = Instant.now();
+                for (DerivedMemoryCandidate event : result.events()) {
+                    insertOrReadEvent(input.provenance(), event, sourceTimestamp, recordedAt);
+                }
+                if (result.summary().isPresent()) {
+                    insertSummary(input.provenance(), result.summary().orElseThrow(), sourceTimestamp, recordedAt);
+                }
+                if (result.currentSituation().isPresent()) {
+                    insertCurrentSituation(input.provenance(), result.currentSituation().orElseThrow(), sourceTimestamp, recordedAt);
+                }
+                try (PreparedStatement coverage = connection.prepareStatement(
+                    "INSERT OR IGNORE INTO memory_compaction_coverage(first_sequence, last_sequence, recorded_at_epoch_millis) VALUES (?, ?, ?)"
+                )) {
+                    coverage.setLong(1, input.provenance().sourceRange().firstSequence());
+                    coverage.setLong(2, input.provenance().sourceRange().lastSequence());
+                    coverage.setLong(3, recordedAt.toEpochMilli());
+                    coverage.executeUpdate();
+                }
+                return loadCompactionSnapshot();
+            });
+        });
+    }
+
+    @Override
+    public CompletionStage<MemoryCompactionSnapshot> readCompactionSnapshot() {
+        return submit(this::loadCompactionSnapshot);
+    }
+
+    @Override
     public CompletionStage<Void> closeAsync() {
         if (!closing.compareAndSet(false, true)) {
             return CompletableFuture.completedFuture(null);
@@ -367,7 +478,7 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
     private List<JournaledBatch> readBatches() throws SQLException {
         List<JournaledBatch> batches = new ArrayList<>();
         try (PreparedStatement batchesQuery = connection.prepareStatement(
-            "SELECT batch_id, seal_reason, sealed_at_epoch_millis FROM journal_batches ORDER BY sealed_at_epoch_millis, batch_id"
+            "SELECT batch_id, seal_reason, sealed_at_epoch_millis FROM journal_batches ORDER BY first_sequence, batch_id"
         ); ResultSet rows = batchesQuery.executeQuery(); PreparedStatement membersQuery = connection.prepareStatement(
             "SELECT message_sequence FROM journal_batch_messages WHERE batch_id = ? ORDER BY ordinal"
         )) {
@@ -409,6 +520,284 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
             }
         }
         return outcomes;
+    }
+
+    private Long sequenceBeforeRecentWorkingWindow() throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+            "SELECT sequence FROM journal_messages ORDER BY sequence DESC LIMIT 1 OFFSET ?"
+        )) {
+            statement.setInt(1, RECENT_WORKING_OBSERVATIONS);
+            try (ResultSet row = statement.executeQuery()) {
+                return row.next() ? row.getLong(1) : null;
+            }
+        }
+    }
+
+    private boolean isCompactionRangeCovered(JournalSequenceRange range) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+            "SELECT 1 FROM memory_compaction_coverage WHERE NOT (last_sequence < ? OR first_sequence > ?) LIMIT 1"
+        )) {
+            statement.setLong(1, range.firstSequence());
+            statement.setLong(2, range.lastSequence());
+            try (ResultSet row = statement.executeQuery()) {
+                return row.next();
+            }
+        }
+    }
+
+    private List<CompactionSource> readCompactionSources(long firstSequence, long lastSequence) throws SQLException {
+        List<CompactionSource> sources = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement(
+            "SELECT sequence, player_uuid, player_name, message_text, captured_at_epoch_millis FROM journal_messages "
+                + "WHERE sequence >= ? AND sequence <= ? AND visibility = ? ORDER BY sequence"
+        )) {
+            statement.setLong(1, firstSequence);
+            statement.setLong(2, lastSequence);
+            statement.setString(3, JournalVisibility.PUBLIC.name());
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) {
+                    sources.add(new CompactionSource(
+                        rows.getLong("sequence"),
+                        new ServerRequester(UUID.fromString(rows.getString("player_uuid")), rows.getString("player_name")),
+                        rows.getString("message_text"),
+                        Instant.ofEpochMilli(rows.getLong("captured_at_epoch_millis"))
+                    ));
+                }
+            }
+        }
+        return sources;
+    }
+
+    private void validatePersistedCompactionInput(MemoryCompactionInput input) throws SQLException {
+        JournalSequenceRange range = input.provenance().sourceRange();
+        Long cutoff = sequenceBeforeRecentWorkingWindow();
+        if (!isCompactionRangeCovered(range) && (cutoff == null || range.lastSequence() > cutoff)) {
+            throw new IllegalArgumentException("Compaction must preserve the recent working window.");
+        }
+        List<CompactionSource> persisted = readCompactionSources(range.firstSequence(), range.lastSequence());
+        if (!persisted.equals(input.sources())) {
+            throw new IllegalArgumentException("Compaction input must exactly match persisted public raw dialogue.");
+        }
+        List<UUID> verifiedBatches = new ArrayList<>();
+        long expected = range.firstSequence();
+        for (UUID batchId : input.provenance().sourceBatchIds()) {
+            JournaledBatch batch = readBatches().stream().filter(value -> value.batchId().equals(batchId)).findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("Compaction provenance references an unknown batch."));
+            if (!readOutcomes().containsKey(batchId) || batch.firstSequence() != expected) {
+                throw new IllegalArgumentException("Compaction provenance must reference contiguous completed batches.");
+            }
+            expected = batch.lastSequence() + 1;
+            verifiedBatches.add(batchId);
+        }
+        if (expected - 1 != range.lastSequence() || !verifiedBatches.equals(input.provenance().sourceBatchIds())) {
+            throw new IllegalArgumentException("Compaction provenance must exactly cover its raw range.");
+        }
+    }
+
+    private static void validateCompactionResult(MemoryCompactionResult result) {
+        for (DerivedMemoryCandidate event : result.events()) {
+            MemoryEvent.requireBoundedContent(event.content(), 600, "event");
+        }
+        result.summary().ifPresent(value -> MemoryEvent.requireBoundedContent(value.content(), 1_200, "summary"));
+        result.currentSituation().ifPresent(value -> MemoryEvent.requireBoundedContent(value.content(), 1_200, "current situation"));
+    }
+
+    private MemoryEvent insertOrReadEvent(
+        DerivedMemoryProvenance provenance,
+        DerivedMemoryCandidate candidate,
+        Instant sourceTimestamp,
+        Instant recordedAt
+    ) throws SQLException {
+        try (PreparedStatement existing = connection.prepareStatement(
+            "SELECT event_id, source_timestamp_epoch_millis, recorded_at_epoch_millis FROM memory_events "
+                + "WHERE content = ? AND scope_type = ? AND COALESCE(scope_player_uuid, '') = COALESCE(?, '') "
+                + "AND visibility = ? AND first_sequence = ? AND last_sequence = ? ORDER BY event_id LIMIT 1"
+        )) {
+            existing.setString(1, candidate.content());
+            existing.setString(2, scopeType(candidate.scope()));
+            setOptionalString(existing, 3, scopePlayerId(candidate.scope()));
+            existing.setString(4, candidate.visibility().name());
+            existing.setLong(5, provenance.sourceRange().firstSequence());
+            existing.setLong(6, provenance.sourceRange().lastSequence());
+            try (ResultSet row = existing.executeQuery()) {
+                if (row.next()) {
+                    UUID id = UUID.fromString(row.getString("event_id"));
+                    return new MemoryEvent(id, candidate.scope(), candidate.visibility(), provenance,
+                        Instant.ofEpochMilli(row.getLong("source_timestamp_epoch_millis")),
+                        Instant.ofEpochMilli(row.getLong("recorded_at_epoch_millis")), candidate.confidence(), candidate.importance(), candidate.content());
+                }
+            }
+        }
+        UUID id = UUID.randomUUID();
+        try (PreparedStatement insert = connection.prepareStatement(
+            "INSERT INTO memory_events(event_id, content, scope_type, scope_player_uuid, visibility, first_sequence, last_sequence, "
+                + "source_timestamp_epoch_millis, recorded_at_epoch_millis, confidence, importance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )) {
+            insert.setString(1, id.toString());
+            insert.setString(2, candidate.content());
+            insert.setString(3, scopeType(candidate.scope()));
+            setOptionalString(insert, 4, scopePlayerId(candidate.scope()));
+            insert.setString(5, candidate.visibility().name());
+            insert.setLong(6, provenance.sourceRange().firstSequence());
+            insert.setLong(7, provenance.sourceRange().lastSequence());
+            insert.setLong(8, sourceTimestamp.toEpochMilli());
+            insert.setLong(9, recordedAt.toEpochMilli());
+            insert.setDouble(10, candidate.confidence().value());
+            insert.setDouble(11, candidate.importance().value());
+            insert.executeUpdate();
+        }
+        insertDerivedSources("EVENT", id, provenance.sourceBatchIds());
+        return new MemoryEvent(id, candidate.scope(), candidate.visibility(), provenance, sourceTimestamp, recordedAt,
+            candidate.confidence(), candidate.importance(), candidate.content());
+    }
+
+    private void insertSummary(
+        DerivedMemoryProvenance provenance,
+        DerivedMemoryCandidate candidate,
+        Instant sourceTimestamp,
+        Instant recordedAt
+    ) throws SQLException {
+        UUID seriesId = findSummarySeries(provenance.sourceRange(), candidate.scope(), candidate.visibility()).orElseGet(UUID::randomUUID);
+        int version = nextVersion("memory_summary_versions", "summary_series_id", seriesId);
+        UUID versionId = UUID.randomUUID();
+        try (PreparedStatement insert = connection.prepareStatement(
+            "INSERT INTO memory_summary_versions(summary_version_id, summary_series_id, version_number, content, scope_type, scope_player_uuid, visibility, "
+                + "first_sequence, last_sequence, source_timestamp_epoch_millis, recorded_at_epoch_millis, confidence, importance) "
+                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )) {
+            insert.setString(1, versionId.toString()); insert.setString(2, seriesId.toString()); insert.setInt(3, version);
+            insert.setString(4, candidate.content()); insert.setString(5, scopeType(candidate.scope()));
+            setOptionalString(insert, 6, scopePlayerId(candidate.scope())); insert.setString(7, candidate.visibility().name());
+            insert.setLong(8, provenance.sourceRange().firstSequence()); insert.setLong(9, provenance.sourceRange().lastSequence());
+            insert.setLong(10, sourceTimestamp.toEpochMilli()); insert.setLong(11, recordedAt.toEpochMilli());
+            insert.setDouble(12, candidate.confidence().value()); insert.setDouble(13, candidate.importance().value()); insert.executeUpdate();
+        }
+        insertDerivedSources("SUMMARY", versionId, provenance.sourceBatchIds());
+    }
+
+    private void insertCurrentSituation(
+        DerivedMemoryProvenance provenance,
+        DerivedMemoryCandidate candidate,
+        Instant sourceTimestamp,
+        Instant recordedAt
+    ) throws SQLException {
+        UUID seriesId = findCurrentSituationSeries(candidate.scope(), candidate.visibility()).orElseGet(UUID::randomUUID);
+        int version = nextVersion("memory_current_situation_versions", "situation_series_id", seriesId);
+        UUID versionId = UUID.randomUUID();
+        try (PreparedStatement insert = connection.prepareStatement(
+            "INSERT INTO memory_current_situation_versions(situation_version_id, situation_series_id, version_number, content, scope_type, scope_player_uuid, visibility, "
+                + "first_sequence, last_sequence, source_timestamp_epoch_millis, recorded_at_epoch_millis, confidence, importance) "
+                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )) {
+            insert.setString(1, versionId.toString()); insert.setString(2, seriesId.toString()); insert.setInt(3, version);
+            insert.setString(4, candidate.content()); insert.setString(5, scopeType(candidate.scope()));
+            setOptionalString(insert, 6, scopePlayerId(candidate.scope())); insert.setString(7, candidate.visibility().name());
+            insert.setLong(8, provenance.sourceRange().firstSequence()); insert.setLong(9, provenance.sourceRange().lastSequence());
+            insert.setLong(10, sourceTimestamp.toEpochMilli()); insert.setLong(11, recordedAt.toEpochMilli());
+            insert.setDouble(12, candidate.confidence().value()); insert.setDouble(13, candidate.importance().value()); insert.executeUpdate();
+        }
+        insertDerivedSources("CURRENT_SITUATION", versionId, provenance.sourceBatchIds());
+    }
+
+    private Optional<UUID> findSummarySeries(JournalSequenceRange range, MemoryScope scope, MemoryVisibility visibility) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+            "SELECT summary_series_id FROM memory_summary_versions WHERE first_sequence = ? AND last_sequence = ? "
+                + "AND scope_type = ? AND COALESCE(scope_player_uuid, '') = COALESCE(?, '') AND visibility = ? "
+                + "ORDER BY version_number DESC LIMIT 1"
+        )) {
+            statement.setLong(1, range.firstSequence()); statement.setLong(2, range.lastSequence()); statement.setString(3, scopeType(scope));
+            setOptionalString(statement, 4, scopePlayerId(scope)); statement.setString(5, visibility.name());
+            try (ResultSet row = statement.executeQuery()) { return row.next() ? Optional.of(UUID.fromString(row.getString(1))) : Optional.empty(); }
+        }
+    }
+
+    private Optional<UUID> findCurrentSituationSeries(MemoryScope scope, MemoryVisibility visibility) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+            "SELECT situation_series_id FROM memory_current_situation_versions WHERE scope_type = ? "
+                + "AND COALESCE(scope_player_uuid, '') = COALESCE(?, '') AND visibility = ? ORDER BY version_number DESC LIMIT 1"
+        )) {
+            statement.setString(1, scopeType(scope)); setOptionalString(statement, 2, scopePlayerId(scope)); statement.setString(3, visibility.name());
+            try (ResultSet row = statement.executeQuery()) { return row.next() ? Optional.of(UUID.fromString(row.getString(1))) : Optional.empty(); }
+        }
+    }
+
+    private int nextVersion(String table, String seriesColumn, UUID seriesId) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement("SELECT COALESCE(MAX(version_number), 0) + 1 FROM " + table + " WHERE " + seriesColumn + " = ?")) {
+            statement.setString(1, seriesId.toString());
+            try (ResultSet row = statement.executeQuery()) { row.next(); return row.getInt(1); }
+        }
+    }
+
+    private void insertDerivedSources(String kind, UUID recordId, List<UUID> batchIds) throws SQLException {
+        try (PreparedStatement insert = connection.prepareStatement(
+            "INSERT INTO memory_derived_sources(record_kind, record_id, batch_id, ordinal) VALUES (?, ?, ?, ?)"
+        )) {
+            for (int ordinal = 0; ordinal < batchIds.size(); ordinal++) {
+                insert.setString(1, kind); insert.setString(2, recordId.toString()); insert.setString(3, batchIds.get(ordinal).toString()); insert.setInt(4, ordinal);
+                insert.addBatch();
+            }
+            insert.executeBatch();
+        }
+    }
+
+    private MemoryCompactionSnapshot loadCompactionSnapshot() throws SQLException {
+        List<MemoryEvent> events = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement("SELECT * FROM memory_events ORDER BY recorded_at_epoch_millis, event_id"); ResultSet rows = statement.executeQuery()) {
+            while (rows.next()) events.add(memoryEvent(rows));
+        }
+        List<MemoryChunkSummary> summaries = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement("SELECT * FROM memory_summary_versions ORDER BY recorded_at_epoch_millis, summary_series_id, version_number"); ResultSet rows = statement.executeQuery()) {
+            while (rows.next()) summaries.add(summary(rows));
+        }
+        List<CurrentSituationVersion> situations = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement("SELECT * FROM memory_current_situation_versions ORDER BY recorded_at_epoch_millis, situation_series_id, version_number"); ResultSet rows = statement.executeQuery()) {
+            while (rows.next()) situations.add(currentSituation(rows));
+        }
+        return new MemoryCompactionSnapshot(worldIdentity, events, summaries, situations);
+    }
+
+    private MemoryEvent memoryEvent(ResultSet row) throws SQLException {
+        UUID id = UUID.fromString(row.getString("event_id"));
+        return new MemoryEvent(id, scope(row), MemoryVisibility.valueOf(row.getString("visibility")),
+            derivedProvenance("EVENT", id, range(row)), Instant.ofEpochMilli(row.getLong("source_timestamp_epoch_millis")),
+            Instant.ofEpochMilli(row.getLong("recorded_at_epoch_millis")), new MemoryConfidence(row.getDouble("confidence")),
+            new MemoryImportance(row.getDouble("importance")), row.getString("content"));
+    }
+
+    private MemoryChunkSummary summary(ResultSet row) throws SQLException {
+        UUID versionId = UUID.fromString(row.getString("summary_version_id"));
+        return new MemoryChunkSummary(UUID.fromString(row.getString("summary_series_id")), versionId, row.getInt("version_number"),
+            scope(row), MemoryVisibility.valueOf(row.getString("visibility")), derivedProvenance("SUMMARY", versionId, range(row)),
+            Instant.ofEpochMilli(row.getLong("source_timestamp_epoch_millis")), Instant.ofEpochMilli(row.getLong("recorded_at_epoch_millis")),
+            new MemoryConfidence(row.getDouble("confidence")), new MemoryImportance(row.getDouble("importance")), row.getString("content"));
+    }
+
+    private CurrentSituationVersion currentSituation(ResultSet row) throws SQLException {
+        UUID versionId = UUID.fromString(row.getString("situation_version_id"));
+        return new CurrentSituationVersion(UUID.fromString(row.getString("situation_series_id")), versionId, row.getInt("version_number"),
+            scope(row), MemoryVisibility.valueOf(row.getString("visibility")), derivedProvenance("CURRENT_SITUATION", versionId, range(row)),
+            Instant.ofEpochMilli(row.getLong("source_timestamp_epoch_millis")), Instant.ofEpochMilli(row.getLong("recorded_at_epoch_millis")),
+            new MemoryConfidence(row.getDouble("confidence")), new MemoryImportance(row.getDouble("importance")), row.getString("content"));
+    }
+
+    private DerivedMemoryProvenance derivedProvenance(String kind, UUID recordId, JournalSequenceRange range) throws SQLException {
+        List<UUID> batches = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement(
+            "SELECT batch_id FROM memory_derived_sources WHERE record_kind = ? AND record_id = ? ORDER BY ordinal"
+        )) {
+            statement.setString(1, kind); statement.setString(2, recordId.toString());
+            try (ResultSet rows = statement.executeQuery()) { while (rows.next()) batches.add(UUID.fromString(rows.getString(1))); }
+        }
+        return new DerivedMemoryProvenance(range, batches);
+    }
+
+    private static JournalSequenceRange range(ResultSet row) throws SQLException {
+        return new JournalSequenceRange(row.getLong("first_sequence"), row.getLong("last_sequence"));
+    }
+
+    private static MemoryScope scope(ResultSet row) throws SQLException {
+        return "WORLD".equals(row.getString("scope_type")) ? MemoryScope.world()
+            : MemoryScope.player(UUID.fromString(row.getString("scope_player_uuid")));
     }
 
     private MemoryRecord insertProposed(
@@ -594,6 +983,15 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
             statement.execute("CREATE INDEX IF NOT EXISTS memory_records_public_recall_idx ON memory_records(record_state, visibility, last_sequence, scope_type, scope_player_uuid)");
             statement.execute("CREATE INDEX IF NOT EXISTS memory_records_source_batch_idx ON memory_records(source_batch_id, first_sequence, last_sequence)");
             statement.execute("CREATE INDEX IF NOT EXISTS memory_confirmations_recall_idx ON memory_confirmations(confirmed_at_epoch_millis, record_id)");
+            statement.execute("CREATE TABLE IF NOT EXISTS memory_events (event_id TEXT PRIMARY KEY, content TEXT NOT NULL CHECK(length(trim(content)) > 0), scope_type TEXT NOT NULL CHECK(scope_type IN ('WORLD', 'PLAYER')), scope_player_uuid TEXT, visibility TEXT NOT NULL CHECK(visibility IN ('PUBLIC', 'PRIVATE')), first_sequence INTEGER NOT NULL, last_sequence INTEGER NOT NULL, source_timestamp_epoch_millis INTEGER NOT NULL, recorded_at_epoch_millis INTEGER NOT NULL, confidence REAL NOT NULL CHECK(confidence >= 0.0 AND confidence <= 1.0), importance REAL NOT NULL CHECK(importance >= 0.0 AND importance <= 1.0), CHECK((scope_type = 'WORLD' AND scope_player_uuid IS NULL) OR (scope_type = 'PLAYER' AND scope_player_uuid IS NOT NULL)), CHECK(last_sequence >= first_sequence))");
+            statement.execute("CREATE TABLE IF NOT EXISTS memory_summary_versions (summary_version_id TEXT PRIMARY KEY, summary_series_id TEXT NOT NULL, version_number INTEGER NOT NULL CHECK(version_number > 0), content TEXT NOT NULL CHECK(length(trim(content)) > 0), scope_type TEXT NOT NULL CHECK(scope_type IN ('WORLD', 'PLAYER')), scope_player_uuid TEXT, visibility TEXT NOT NULL CHECK(visibility IN ('PUBLIC', 'PRIVATE')), first_sequence INTEGER NOT NULL, last_sequence INTEGER NOT NULL, source_timestamp_epoch_millis INTEGER NOT NULL, recorded_at_epoch_millis INTEGER NOT NULL, confidence REAL NOT NULL CHECK(confidence >= 0.0 AND confidence <= 1.0), importance REAL NOT NULL CHECK(importance >= 0.0 AND importance <= 1.0), UNIQUE(summary_series_id, version_number), CHECK((scope_type = 'WORLD' AND scope_player_uuid IS NULL) OR (scope_type = 'PLAYER' AND scope_player_uuid IS NOT NULL)), CHECK(last_sequence >= first_sequence))");
+            statement.execute("CREATE TABLE IF NOT EXISTS memory_current_situation_versions (situation_version_id TEXT PRIMARY KEY, situation_series_id TEXT NOT NULL, version_number INTEGER NOT NULL CHECK(version_number > 0), content TEXT NOT NULL CHECK(length(trim(content)) > 0), scope_type TEXT NOT NULL CHECK(scope_type IN ('WORLD', 'PLAYER')), scope_player_uuid TEXT, visibility TEXT NOT NULL CHECK(visibility IN ('PUBLIC', 'PRIVATE')), first_sequence INTEGER NOT NULL, last_sequence INTEGER NOT NULL, source_timestamp_epoch_millis INTEGER NOT NULL, recorded_at_epoch_millis INTEGER NOT NULL, confidence REAL NOT NULL CHECK(confidence >= 0.0 AND confidence <= 1.0), importance REAL NOT NULL CHECK(importance >= 0.0 AND importance <= 1.0), UNIQUE(situation_series_id, version_number), CHECK((scope_type = 'WORLD' AND scope_player_uuid IS NULL) OR (scope_type = 'PLAYER' AND scope_player_uuid IS NOT NULL)), CHECK(last_sequence >= first_sequence))");
+            statement.execute("CREATE TABLE IF NOT EXISTS memory_derived_sources (record_kind TEXT NOT NULL CHECK(record_kind IN ('EVENT', 'SUMMARY', 'CURRENT_SITUATION')), record_id TEXT NOT NULL, batch_id TEXT NOT NULL REFERENCES journal_batches(batch_id), ordinal INTEGER NOT NULL, PRIMARY KEY(record_kind, record_id, batch_id), UNIQUE(record_kind, record_id, ordinal))");
+            statement.execute("CREATE TABLE IF NOT EXISTS memory_compaction_coverage (first_sequence INTEGER NOT NULL, last_sequence INTEGER NOT NULL, recorded_at_epoch_millis INTEGER NOT NULL, PRIMARY KEY(first_sequence, last_sequence), CHECK(last_sequence >= first_sequence))");
+            statement.execute("CREATE INDEX IF NOT EXISTS memory_events_source_range_idx ON memory_events(first_sequence, last_sequence)");
+            statement.execute("CREATE INDEX IF NOT EXISTS memory_summary_versions_source_range_idx ON memory_summary_versions(first_sequence, last_sequence)");
+            statement.execute("CREATE INDEX IF NOT EXISTS memory_situations_scope_idx ON memory_current_situation_versions(scope_type, scope_player_uuid, visibility, version_number)");
+            statement.execute("CREATE INDEX IF NOT EXISTS memory_coverage_range_idx ON memory_compaction_coverage(first_sequence, last_sequence)");
         }
     }
 

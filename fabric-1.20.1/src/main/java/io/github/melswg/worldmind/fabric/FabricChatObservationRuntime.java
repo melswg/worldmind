@@ -22,6 +22,9 @@ import io.github.melswg.worldmind.core.journal.JournalParticipationDecision;
 import io.github.melswg.worldmind.core.journal.JournaledBatch;
 import io.github.melswg.worldmind.core.journal.ProviderAttemptOutcome;
 import io.github.melswg.worldmind.core.memory.WorldMemoryRepository;
+import io.github.melswg.worldmind.core.memory.DeterministicMemoryCompactionGenerator;
+import io.github.melswg.worldmind.core.memory.MemoryCompactionRepository;
+import io.github.melswg.worldmind.core.memory.MemoryCompactionService;
 import java.time.Clock;
 import java.util.List;
 import java.util.Objects;
@@ -49,7 +52,9 @@ final class FabricChatObservationRuntime implements AutoCloseable {
     private final Executor serverScheduler;
     private final Clock clock;
     private final ConversationApplicationService applicationService;
+    private final MemoryCompactionService compactionService;
     private final ProviderCapabilities providerCapabilities;
+    private final FabricChatDiagnostics diagnostics;
     private final FabricChatOutcomeRouter outcomeRouter;
     private final ChatBatchCoordinator batchCoordinator;
 
@@ -114,6 +119,10 @@ final class FabricChatObservationRuntime implements AutoCloseable {
         this.serverScheduler = Objects.requireNonNull(serverScheduler, "serverScheduler");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.applicationService = Objects.requireNonNull(applicationService, "applicationService");
+        this.diagnostics = Objects.requireNonNull(diagnostics, "diagnostics");
+        this.compactionService = journal instanceof MemoryCompactionRepository repository
+            ? new MemoryCompactionService(repository, new DeterministicMemoryCompactionGenerator())
+            : null;
         this.providerCapabilities = Objects.requireNonNull(providerCapabilities, "providerCapabilities");
         this.outcomeRouter = new FabricChatOutcomeRouter(
             ownedWorld,
@@ -121,7 +130,7 @@ final class FabricChatObservationRuntime implements AutoCloseable {
             validated.profile().chatNameColor(),
             active::get,
             chatSink,
-            diagnostics
+            this.diagnostics
         );
         batchCoordinator = new ChatBatchCoordinator(
             validated.globalConfiguration().chatBatching(),
@@ -233,7 +242,19 @@ final class FabricChatObservationRuntime implements AutoCloseable {
             : new ConversationRefusal(RefusalCode.PROVIDER_UNAVAILABLE);
         JournalDeliveryReport delivery = outcomeRouter.deliver(batch, resolved);
         JournalBatchOutcome audit = journalOutcome(journaledBatch, resolved, delivery);
-        journal.appendOutcome(audit).whenComplete((ignored, journalFailure) -> completed.complete(null));
+        journal.appendOutcome(audit).whenComplete((ignored, journalFailure) -> {
+            if (journalFailure == null && compactionService != null && active.get()) {
+                compactionService.compactNext(ownedWorld).whenComplete((compacted, compactionFailure) -> {
+                    if (compactionFailure != null) {
+                        diagnostics.record(FabricChatDeliveryDiagnostic.delivery(
+                            FabricChatDeliveryDiagnosticKind.COMPACTION_FAILED,
+                            journaledBatch.firstSequence(), journaledBatch.lastSequence()
+                        ));
+                    }
+                });
+            }
+            completed.complete(null);
+        });
     }
 
     private JournalBatchOutcome journalOutcome(
