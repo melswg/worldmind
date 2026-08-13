@@ -12,10 +12,13 @@ final class WorldmindCommandText {
         String batching = status.batching().map(value -> " batch=" + value.pendingMessages() + "/" + value.pendingBatches()
             + " limits=" + value.maxMessages() + "/" + value.maxWaitMillis() + "/" + value.maxEstimatedInputCharacters()).orElse(" batch=unavailable");
         String circuit = status.circuit().map(value -> " circuit=" + value.state() + " failures="
-            + value.consecutiveQualifyingFailures() + " probe=" + value.probeInFlight()).orElse(" circuit=unavailable");
+            + value.consecutiveQualifyingFailures() + " cooldown=" + (value.cooldownUntil().isPresent() ? "active" : "none")
+            + " probe=" + value.probeInFlight()).orElse(" circuit=unavailable");
         return "Worldmind lifecycle=" + status.lifecycle()
             + " reload=" + status.reload()
             + " integration=" + (status.integrationEnabled() ? "ENABLED" : "DISABLED")
+            + status.activeProfile().map(value -> " profile=" + value).orElse("")
+            + status.disableReason().map(value -> " disableReason=" + value).orElse("")
             + " provider=" + status.providerAvailability()
             + " queue=" + status.work().queued() + "/" + status.work().inFlight() + "/" + status.work().closed()
             + " retry=" + status.work().retryAttempts() + "/" + status.work().waitingBackoff()

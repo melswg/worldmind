@@ -21,4 +21,6 @@ public interface WorldmindAdministration {
         MemoryRecordType recordType,
         String stableIdentity
     );
+
+    CompletionStage<MemoryExportResult> export(MemoryInspectionScope scope);
 }

@@ -11,6 +11,8 @@ import io.github.melswg.worldmind.core.administration.MemoryInspectionRepository
 import io.github.melswg.worldmind.core.administration.MemoryInspectionResult;
 import io.github.melswg.worldmind.core.administration.MemoryInspectionScope;
 import io.github.melswg.worldmind.core.administration.MemoryRecordType;
+import io.github.melswg.worldmind.core.administration.MemoryExportRepository;
+import io.github.melswg.worldmind.core.administration.MemoryExportResult;
 import io.github.melswg.worldmind.core.administration.ProviderAvailability;
 import io.github.melswg.worldmind.core.administration.ReloadResult;
 import io.github.melswg.worldmind.core.administration.RuntimeLifecycleState;
@@ -66,6 +68,8 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
     private final ProviderCredentialResolver providerCredentials;
     private final FabricCommandBroadcastCorrelation commandBroadcastCorrelation = new FabricCommandBroadcastCorrelation();
     private final ExecutorService administrationExecutor;
+    private final ExecutorService exportExecutor;
+    private final WorldmindMemoryExportPublisher exportPublisher;
     private final AtomicBoolean reloadInProgress = new AtomicBoolean();
 
     private WorldmindAuthoritativeRuntime runtime;
@@ -75,6 +79,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
     private WorldIdentityLifecycle worldIdentity;
     private PendingJournalStart pendingJournalStart;
     private MinecraftServer server;
+    private Path saveRoot;
     private long lifecycleGeneration;
     private RuntimeLifecycleState lifecycleState = RuntimeLifecycleState.STOPPED;
     private RuntimeReloadState reloadState = RuntimeReloadState.IDLE;
@@ -122,11 +127,14 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
         this.configurationLoader = Objects.requireNonNull(configurationLoader, "configurationLoader");
         this.providerCredentials = Objects.requireNonNull(providerCredentials, "providerCredentials");
         this.administrationExecutor = Objects.requireNonNull(administrationExecutor, "administrationExecutor");
+        this.exportExecutor = Executors.newSingleThreadExecutor(daemonThreadFactory("worldmind-memory-export"));
+        this.exportPublisher = new WorldmindMemoryExportPublisher(exportExecutor, Clock.systemUTC());
     }
 
     synchronized void onServerStarted(MinecraftServer startedServer) {
         retireCurrentGeneration(true);
         server = startedServer;
+        saveRoot = startedServer == null ? null : startedServer.getSavePath(WorldSavePath.ROOT);
         long generation = ++lifecycleGeneration;
         lifecycleState = RuntimeLifecycleState.STARTING;
         reloadState = RuntimeReloadState.IDLE;
@@ -152,6 +160,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
         ++lifecycleGeneration;
         retireCurrentGeneration(true);
         server = null;
+        saveRoot = null;
         lifecycleState = RuntimeLifecycleState.STOPPED;
         storageHealth = StorageHealth.CLOSED;
     }
@@ -273,6 +282,26 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
     }
 
     @Override
+    public CompletionStage<MemoryExportResult> export(MemoryInspectionScope scope) {
+        Objects.requireNonNull(scope, "scope");
+        MemoryExportRepository repository;
+        Path root;
+        String worldId;
+        synchronized (this) {
+            if (lifecycleState != RuntimeLifecycleState.RUNNING) {
+                return CompletableFuture.completedFuture(MemoryExportResult.of(AdministrationResultCode.LIFECYCLE_NOT_READY));
+            }
+            if (journal == null || worldIdentity == null || saveRoot == null || storageHealth != StorageHealth.READY) {
+                return CompletableFuture.completedFuture(MemoryExportResult.of(AdministrationResultCode.STORAGE_NOT_READY));
+            }
+            repository = journal;
+            root = saveRoot;
+            worldId = worldIdentity.identity().stableId();
+        }
+        return exportPublisher.export(repository, root, worldId, scope);
+    }
+
+    @Override
     public CompletionStage<ReloadResult> reload() {
         MinecraftServer reloadServer;
         long invocationGeneration;
@@ -286,6 +315,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
             if (!reloadInProgress.compareAndSet(false, true)) {
                 return CompletableFuture.completedFuture(ReloadResult.of(AdministrationResultCode.RELOAD_IN_PROGRESS));
             }
+            exportPublisher.cancelActive();
             reloadState = RuntimeReloadState.VALIDATING;
         }
         CompletableFuture<ReloadResult> result = new CompletableFuture<>();
@@ -466,6 +496,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
     }
 
     private void retireCurrentGeneration(boolean closeJournal) {
+        exportPublisher.cancelActive();
         commandBroadcastCorrelation.clear();
         FabricChatObservationRuntime retiring = chatObservation;
         SqliteDialogueJournal closingJournal = journal;

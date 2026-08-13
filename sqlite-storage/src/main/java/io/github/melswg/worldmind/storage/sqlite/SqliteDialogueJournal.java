@@ -27,6 +27,10 @@ import io.github.melswg.worldmind.core.administration.MemoryInspectionQuery;
 import io.github.melswg.worldmind.core.administration.MemoryInspectionRepository;
 import io.github.melswg.worldmind.core.administration.MemoryInspectionScope;
 import io.github.melswg.worldmind.core.administration.MemoryRecordType;
+import io.github.melswg.worldmind.core.administration.MemoryExportPage;
+import io.github.melswg.worldmind.core.administration.MemoryExportQuery;
+import io.github.melswg.worldmind.core.administration.MemoryExportRecord;
+import io.github.melswg.worldmind.core.administration.MemoryExportRepository;
 import io.github.melswg.worldmind.core.memory.JournalSequenceRange;
 import io.github.melswg.worldmind.core.memory.CompactionSource;
 import io.github.melswg.worldmind.core.memory.CurrentSituationVersion;
@@ -86,7 +90,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /** SQLite schema-v1 journal. Every JDBC action is serialized on one private worker thread. */
 public final class SqliteDialogueJournal implements DialogueJournal, WorldMemoryRepository, MemoryCompactionRepository,
-    MemoryInspectionRepository {
+    MemoryInspectionRepository, MemoryExportRepository {
     public static final String DATABASE_FILE_NAME = "worldmind.sqlite3";
     private static final int SCHEMA_VERSION = 1;
     private static final int RECENT_WORKING_OBSERVATIONS = 24;
@@ -216,7 +220,7 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
                 setOptionalString(statement, 3, outcome.decision().map(Enum::name));
                 setOptionalString(statement, 4, outcome.refusalCode().map(Enum::name));
                 statement.setString(5, outcome.delivery().status().name());
-                setOptionalString(statement, 6, outcome.delivery().deliveredResponse());
+                setOptionalString(statement, 6, outcome.delivery().deliveredResponse().map(SecretRedactionPolicy::redact));
                 statement.setLong(7, outcome.completedAt().toEpochMilli());
                 statement.executeUpdate();
                 return null;
@@ -256,6 +260,13 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
             );
             return page.records().isEmpty() ? Optional.empty() : Optional.of(page.records().get(0));
         });
+    }
+
+    /** Export pages share exactly the inspection scope predicate but retain full text and membership. */
+    @Override
+    public CompletionStage<MemoryExportPage> exportPage(MemoryExportQuery query) {
+        Objects.requireNonNull(query, "query");
+        return submit(() -> readExportPage(query));
     }
 
     @Override
@@ -953,6 +964,80 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
     }
     private record BoundedText(String text, boolean truncated) { }
 
+    private MemoryExportPage readExportPage(MemoryExportQuery query) throws SQLException {
+        InspectionSql selection = inspectionSelect(query.recordType(), query.scope());
+        StringBuilder sql = new StringBuilder("SELECT * FROM (").append(selection.sql()).append(") exported WHERE 1 = 1");
+        query.after().ifPresent(ignored -> sql.append(" AND (")
+            .append("last_sequence < ? OR (last_sequence = ? AND first_sequence < ?) OR ")
+            .append("(last_sequence = ? AND first_sequence = ? AND recorded_at_epoch_millis < ?) OR ")
+            .append("(last_sequence = ? AND first_sequence = ? AND recorded_at_epoch_millis = ? AND stable_identity > ?))"));
+        sql.append(" ORDER BY last_sequence DESC, first_sequence DESC, recorded_at_epoch_millis DESC, stable_identity ASC LIMIT ?");
+        List<MemoryExportRecord> records = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement(sql.toString())) {
+            int parameter = 1;
+            for (String value : selection.parameters()) statement.setString(parameter++, value);
+            if (query.after().isPresent()) parameter = bindCursor(statement, parameter, query.after().orElseThrow());
+            statement.setInt(parameter, MemoryExportQuery.PAGE_SIZE + 1);
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) records.add(exportRecord(rows, query.recordType()));
+            }
+        }
+        if (records.size() <= MemoryExportQuery.PAGE_SIZE) return new MemoryExportPage(records, Optional.empty());
+        MemoryExportRecord cursorRecord = records.get(MemoryExportQuery.PAGE_SIZE - 1);
+        records.remove(MemoryExportQuery.PAGE_SIZE);
+        return new MemoryExportPage(records, Optional.of(new MemoryInspectionCursor(query.recordType(), query.scope().fingerprint(),
+            cursorRecord.lastSequence(), cursorRecord.firstSequence(), cursorRecord.recordedAt().toEpochMilli(),
+            cursorRecord.stableIdentity())));
+    }
+
+    private MemoryExportRecord exportRecord(ResultSet row, MemoryRecordType type) throws SQLException {
+        long first = row.getLong("first_sequence");
+        long last = row.getLong("last_sequence");
+        String originKind = row.getString("origin_kind");
+        String originId = row.getString("origin_id");
+        Optional<MemoryConfirmation> confirmation = memoryConfirmation(type, row.getString("stable_identity"));
+        return new MemoryExportRecord(
+            row.getString("stable_identity"), type, first, last, inspectionScope(row), row.getString("visibility"),
+            row.getString("source_type"), Instant.ofEpochMilli(row.getLong("source_at_epoch_millis")),
+            Instant.ofEpochMilli(row.getLong("recorded_at_epoch_millis")), optionalDouble(row, "confidence"), optionalDouble(row, "importance"),
+            Optional.ofNullable(row.getString("state")), optionalUuid(row, "relationship_subject_uuid"), optionalInt(row, "version_number"),
+            optionalBoolean(row, "latest"), Optional.ofNullable(row.getString("superseded_by")),
+            new MemoryAuditProvenance(first, last, inspectionBatchIds(originKind, originId)), optionalUuid(row, "actor_player_uuid"),
+            sanitizeInspectionText(SecretRedactionPolicy.redact(row.getString("content") == null ? "" : row.getString("content"))),
+            "BATCH".equals(originKind) ? fullMembership(originId) : List.of(),
+            confirmation.map(value -> value.authority().name()), confirmation.map(MemoryConfirmation::confirmedAt)
+        );
+    }
+
+    private List<Long> fullMembership(String batchId) throws SQLException {
+        List<Long> sequences = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement(
+            "SELECT message_sequence FROM journal_batch_messages WHERE batch_id = ? ORDER BY ordinal"
+        )) {
+            statement.setString(1, batchId);
+            try (ResultSet rows = statement.executeQuery()) { while (rows.next()) sequences.add(rows.getLong(1)); }
+        }
+        return List.copyOf(sequences);
+    }
+
+    private Optional<MemoryConfirmation> memoryConfirmation(MemoryRecordType type, String stableIdentity) throws SQLException {
+        if (type != MemoryRecordType.FACT && type != MemoryRecordType.RELATIONSHIP) return Optional.empty();
+        int colon = stableIdentity.indexOf(':');
+        if (colon < 0 || colon == stableIdentity.length() - 1) return Optional.empty();
+        try (PreparedStatement statement = connection.prepareStatement(
+            "SELECT authority, confirmed_at_epoch_millis FROM memory_confirmations WHERE record_id = ?"
+        )) {
+            statement.setString(1, stableIdentity.substring(colon + 1));
+            try (ResultSet rows = statement.executeQuery()) {
+                if (!rows.next()) return Optional.empty();
+                return Optional.of(new MemoryConfirmation(
+                    io.github.melswg.worldmind.core.memory.MemoryConfirmationAuthority.valueOf(rows.getString("authority")),
+                    "redacted", Instant.ofEpochMilli(rows.getLong("confirmed_at_epoch_millis"))
+                ));
+            }
+        }
+    }
+
     private List<JournaledObservation> readObservations() throws SQLException {
         List<JournaledObservation> observations = new ArrayList<>();
         try (PreparedStatement statement = connection.prepareStatement(
@@ -1107,12 +1192,13 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
         Instant sourceTimestamp,
         Instant recordedAt
     ) throws SQLException {
+        String content = SecretRedactionPolicy.redact(candidate.content());
         try (PreparedStatement existing = connection.prepareStatement(
             "SELECT event_id, source_timestamp_epoch_millis, recorded_at_epoch_millis FROM memory_events "
                 + "WHERE content = ? AND scope_type = ? AND COALESCE(scope_player_uuid, '') = COALESCE(?, '') "
                 + "AND visibility = ? AND first_sequence = ? AND last_sequence = ? ORDER BY event_id LIMIT 1"
         )) {
-            existing.setString(1, candidate.content());
+            existing.setString(1, content);
             existing.setString(2, scopeType(candidate.scope()));
             setOptionalString(existing, 3, scopePlayerId(candidate.scope()));
             existing.setString(4, candidate.visibility().name());
@@ -1123,7 +1209,7 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
                     UUID id = UUID.fromString(row.getString("event_id"));
                     return new MemoryEvent(id, candidate.scope(), candidate.visibility(), provenance,
                         Instant.ofEpochMilli(row.getLong("source_timestamp_epoch_millis")),
-                        Instant.ofEpochMilli(row.getLong("recorded_at_epoch_millis")), candidate.confidence(), candidate.importance(), candidate.content());
+                        Instant.ofEpochMilli(row.getLong("recorded_at_epoch_millis")), candidate.confidence(), candidate.importance(), content);
                 }
             }
         }
@@ -1133,7 +1219,7 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
                 + "source_timestamp_epoch_millis, recorded_at_epoch_millis, confidence, importance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )) {
             insert.setString(1, id.toString());
-            insert.setString(2, candidate.content());
+            insert.setString(2, content);
             insert.setString(3, scopeType(candidate.scope()));
             setOptionalString(insert, 4, scopePlayerId(candidate.scope()));
             insert.setString(5, candidate.visibility().name());
@@ -1147,7 +1233,7 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
         }
         insertDerivedSources("EVENT", id, provenance.sourceBatchIds());
         return new MemoryEvent(id, candidate.scope(), candidate.visibility(), provenance, sourceTimestamp, recordedAt,
-            candidate.confidence(), candidate.importance(), candidate.content());
+            candidate.confidence(), candidate.importance(), content);
     }
 
     private void insertSummary(
@@ -1165,7 +1251,7 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
                 + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )) {
             insert.setString(1, versionId.toString()); insert.setString(2, seriesId.toString()); insert.setInt(3, version);
-            insert.setString(4, candidate.content()); insert.setString(5, scopeType(candidate.scope()));
+            insert.setString(4, SecretRedactionPolicy.redact(candidate.content())); insert.setString(5, scopeType(candidate.scope()));
             setOptionalString(insert, 6, scopePlayerId(candidate.scope())); insert.setString(7, candidate.visibility().name());
             insert.setLong(8, provenance.sourceRange().firstSequence()); insert.setLong(9, provenance.sourceRange().lastSequence());
             insert.setLong(10, sourceTimestamp.toEpochMilli()); insert.setLong(11, recordedAt.toEpochMilli());
@@ -1189,7 +1275,7 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
                 + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )) {
             insert.setString(1, versionId.toString()); insert.setString(2, seriesId.toString()); insert.setInt(3, version);
-            insert.setString(4, candidate.content()); insert.setString(5, scopeType(candidate.scope()));
+            insert.setString(4, SecretRedactionPolicy.redact(candidate.content())); insert.setString(5, scopeType(candidate.scope()));
             setOptionalString(insert, 6, scopePlayerId(candidate.scope())); insert.setString(7, candidate.visibility().name());
             insert.setLong(8, provenance.sourceRange().firstSequence()); insert.setLong(9, provenance.sourceRange().lastSequence());
             insert.setLong(10, sourceTimestamp.toEpochMilli()); insert.setLong(11, recordedAt.toEpochMilli());
@@ -1311,11 +1397,11 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
         String relationshipSubjectId;
         if (candidate instanceof ProposedFactCandidate fact) {
             recordType = "FACT";
-            content = fact.content();
+            content = SecretRedactionPolicy.redact(fact.content());
             relationshipSubjectId = null;
         } else if (candidate instanceof ProposedRelationshipCandidate relationship) {
             recordType = "RELATIONSHIP";
-            content = relationship.relationshipState();
+            content = SecretRedactionPolicy.redact(relationship.relationshipState());
             relationshipSubjectId = relationship.subjectPlayerId().toString();
         } else {
             throw new IllegalArgumentException("Unsupported proposed memory candidate type.");

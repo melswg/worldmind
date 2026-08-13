@@ -11,6 +11,7 @@ import io.github.melswg.worldmind.core.administration.MemoryInspectionQuery;
 import io.github.melswg.worldmind.core.administration.MemoryInspectionResult;
 import io.github.melswg.worldmind.core.administration.MemoryInspectionScope;
 import io.github.melswg.worldmind.core.administration.MemoryRecordType;
+import io.github.melswg.worldmind.core.administration.MemoryExportResult;
 import io.github.melswg.worldmind.core.configuration.ConfigurationDiagnostic;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -49,6 +50,10 @@ final class WorldmindCommandRegistration {
         com.mojang.brigadier.builder.RequiredArgumentBuilder<ServerCommandSource, java.util.UUID> detailPlayerUuid = CommandManager
             .argument("player-uuid", UuidArgumentType.uuid());
         addPlayerRecordTypes(detailPlayerUuid, lifecycle, true);
+        com.mojang.brigadier.builder.RequiredArgumentBuilder<ServerCommandSource, java.util.UUID> exportPlayerUuid = CommandManager
+            .argument("player-uuid", UuidArgumentType.uuid())
+            .executes(context -> export(context, lifecycle,
+                MemoryInspectionScope.player(UuidArgumentType.getUuid(context, "player-uuid"))));
         return CommandManager.literal("memory")
             .executes(context -> {
                 context.getSource().sendFeedback(() -> Text.literal("Worldmind memory: inspect, detail, export."), false);
@@ -59,7 +64,10 @@ final class WorldmindCommandRegistration {
                 .then(CommandManager.literal("player").then(inspectPlayerUuid)))
             .then(CommandManager.literal("detail")
                 .then(detailWorld)
-                .then(CommandManager.literal("player").then(detailPlayerUuid)));
+                .then(CommandManager.literal("player").then(detailPlayerUuid)))
+            .then(CommandManager.literal("export")
+                .then(CommandManager.literal("world").executes(context -> export(context, lifecycle, MemoryInspectionScope.world())))
+                .then(CommandManager.literal("player").then(exportPlayerUuid)));
     }
 
     private static void addWorldRecordTypes(
@@ -147,6 +155,10 @@ final class WorldmindCommandRegistration {
         MemoryRecordType type,
         String stableIdentity
     ) {
+        if (stableIdentity == null || stableIdentity.length() > 160 || !stableIdentity.startsWith(type.commandValue() + ":")) {
+            context.getSource().sendError(Text.literal("Worldmind memory detail: INVALID_RECORD_ID."));
+            return 0;
+        }
         ServerCommandSource source = context.getSource();
         long generation = lifecycle.currentGeneration();
         lifecycle.detail(scope, type, stableIdentity).whenComplete((result, failure) -> lifecycle.deliverForCurrentGeneration(
@@ -176,6 +188,35 @@ final class WorldmindCommandRegistration {
         result.page().orElseThrow().next().ifPresent(cursor -> source.sendFeedback(() -> Text.literal(
             "Next: /worldmind memory inspect " + scopeCommand(query.scope()) + " " + query.recordType().commandValue()
                 + " after " + cursor.encode()), false));
+    }
+
+    private static int export(
+        CommandContext<ServerCommandSource> context, WorldmindFabricServerLifecycle lifecycle, MemoryInspectionScope scope
+    ) {
+        ServerCommandSource source = context.getSource();
+        long generation = lifecycle.currentGeneration();
+        CompletableFuture<MemoryExportResult> operation = lifecycle.export(scope).toCompletableFuture();
+        if (operation.isDone()) {
+            MemoryExportResult immediate = operation.getNow(null);
+            sendExport(source, immediate, null);
+            return immediate != null && immediate.code() == io.github.melswg.worldmind.core.administration.AdministrationResultCode.SUCCESS ? 1 : 0;
+        }
+        operation.whenComplete((result, failure) -> lifecycle.deliverForCurrentGeneration(source.getServer(), generation,
+            () -> sendExport(source, result, failure)));
+        source.sendFeedback(() -> Text.literal("Worldmind memory export accepted."), false);
+        return 1;
+    }
+
+    private static void sendExport(ServerCommandSource source, MemoryExportResult result, Throwable failure) {
+        if (failure != null || result == null) {
+            source.sendError(Text.literal("Worldmind memory export: IO_FAILURE."));
+            return;
+        }
+        if (result.code() != io.github.melswg.worldmind.core.administration.AdministrationResultCode.SUCCESS) {
+            source.sendError(Text.literal("Worldmind memory export: " + result.code() + "."));
+            return;
+        }
+        source.sendFeedback(() -> Text.literal("Worldmind memory export completed: " + result.relativeArtifact().orElseThrow()), false);
     }
 
     private static String scopeCommand(MemoryInspectionScope scope) {
