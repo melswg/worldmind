@@ -64,8 +64,12 @@ import io.github.melswg.worldmind.core.memory.RetrievedMemoryRecordType;
 import io.github.melswg.worldmind.core.memory.WorldMemoryRepository;
 import io.github.melswg.worldmind.core.memory.WorldMemorySnapshot;
 import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -73,6 +77,8 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -88,11 +94,19 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** SQLite schema-v1 journal. Every JDBC action is serialized on one private worker thread. */
+/**
+ * SQLite schema-v2 journal. Every JDBC action, including opening, backup and
+ * migration, is serialized on one private worker thread.
+ *
+ * <p>Version 2 keeps the v1 message-shaped view for read compatibility while
+ * storing the payload separately, so unavailable raw dialogue has no path
+ * back into prompts, compaction, search, inspection or export.</p>
+ */
 public final class SqliteDialogueJournal implements DialogueJournal, WorldMemoryRepository, MemoryCompactionRepository,
     MemoryInspectionRepository, MemoryExportRepository {
     public static final String DATABASE_FILE_NAME = "worldmind.sqlite3";
-    private static final int SCHEMA_VERSION = 1;
+    public static final int SCHEMA_VERSION = 2;
+    public static final int OLDEST_SUPPORTED_SCHEMA_VERSION = 1;
     private static final int RECENT_WORKING_OBSERVATIONS = 24;
     private static final int MAX_COMPACTION_BATCHES = 8;
     private static final int MAX_COMPACTION_MESSAGES = 32;
@@ -114,6 +128,11 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
         return worldIdentity;
     }
 
+    /** The schema published by this journal; safe for status and tests. */
+    public int openedSchemaVersion() {
+        return SCHEMA_VERSION;
+    }
+
     public static CompletionStage<SqliteDialogueJournal> open(Path databasePath) {
         Objects.requireNonNull(databasePath, "databasePath");
         ExecutorService executor = Executors.newSingleThreadExecutor(new JournalThreadFactory());
@@ -126,7 +145,7 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
                 }
                 Connection connection = DriverManager.getConnection("jdbc:sqlite:" + absolute);
                 try {
-                    configureAndInitialize(connection);
+                    configureAndInitialize(connection, absolute);
                     return new SqliteDialogueJournal(executor, connection, loadWorldIdentity(connection));
                 } catch (Throwable failure) {
                     closeConnection(connection);
@@ -154,20 +173,27 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
         Objects.requireNonNull(observation, "observation");
         String redactedMessage = SecretRedactionPolicy.redact(observation.message());
         return submit(() -> {
-            String sql = "INSERT INTO journal_messages(player_uuid, player_name, message_text, captured_at_epoch_millis, source, visibility, addressing_signal) VALUES (?, ?, ?, ?, ?, ?, ?)";
+            String sql = "INSERT INTO journal_observations(player_uuid, captured_at_epoch_millis, source, visibility, addressing_signal, raw_state) VALUES (?, ?, ?, ?, ?, 'AVAILABLE')";
             try (PreparedStatement statement = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
                 statement.setString(1, observation.requester().playerId().toString());
-                statement.setString(2, observation.requester().playerName());
-                statement.setString(3, redactedMessage);
-                statement.setLong(4, observation.capturedAt().toEpochMilli());
-                statement.setString(5, JournalMessageSource.PUBLIC_CHAT.name());
-                statement.setString(6, JournalVisibility.PUBLIC.name());
-                statement.setString(7, observation.addressingSignal().name());
+                statement.setLong(2, observation.capturedAt().toEpochMilli());
+                statement.setString(3, JournalMessageSource.PUBLIC_CHAT.name());
+                statement.setString(4, JournalVisibility.PUBLIC.name());
+                statement.setString(5, observation.addressingSignal().name());
                 statement.executeUpdate();
                 try (ResultSet keys = statement.getGeneratedKeys()) {
                     if (!keys.next()) throw new SQLException("SQLite did not return a journal sequence.");
+                    long sequence = keys.getLong(1);
+                    try (PreparedStatement payload = connection.prepareStatement(
+                        "INSERT INTO journal_observation_payloads(sequence, player_name, message_text) VALUES (?, ?, ?)"
+                    )) {
+                        payload.setLong(1, sequence);
+                        payload.setString(2, observation.requester().playerName());
+                        payload.setString(3, redactedMessage);
+                        payload.executeUpdate();
+                    }
                     return new JournaledObservation(
-                        worldIdentity, keys.getLong(1), observation.requester(), redactedMessage, observation.capturedAt(),
+                        worldIdentity, sequence, observation.requester(), redactedMessage, observation.capturedAt(),
                         JournalMessageSource.PUBLIC_CHAT, JournalVisibility.PUBLIC, observation.addressingSignal()
                     );
                 }
@@ -1536,33 +1562,59 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
         }, executor);
     }
 
-    private static void configureAndInitialize(Connection connection) throws SQLException {
+    private static void configureAndInitialize(Connection connection, Path databasePath) throws SQLException, IOException {
         try (Statement statement = connection.createStatement()) {
             statement.execute("PRAGMA foreign_keys = ON");
             statement.execute("PRAGMA journal_mode = WAL");
             statement.execute("PRAGMA synchronous = FULL");
+            statement.execute("PRAGMA secure_delete = ON");
             statement.execute("CREATE TABLE IF NOT EXISTS journal_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
         }
         String version = metadata(connection, "schema_version");
         if (version == null) {
-            try (PreparedStatement insert = connection.prepareStatement("INSERT INTO journal_metadata(key, value) VALUES (?, ?)") ) {
-                insert.setString(1, "schema_version"); insert.setString(2, Integer.toString(SCHEMA_VERSION)); insert.executeUpdate();
-                insert.setString(1, "world_id"); insert.setString(2, UUID.randomUUID().toString()); insert.executeUpdate();
-            }
-            createSchemaV1(connection);
-        } else if (Integer.parseInt(version) != SCHEMA_VERSION) {
-            throw new SqliteJournalSchemaException("Unsupported SQLite journal schema version " + version + ".");
+            withTransaction(connection, () -> {
+                try (PreparedStatement insert = connection.prepareStatement("INSERT INTO journal_metadata(key, value) VALUES (?, ?)") ) {
+                    insert.setString(1, "schema_version"); insert.setString(2, Integer.toString(SCHEMA_VERSION)); insert.executeUpdate();
+                    insert.setString(1, "world_id"); insert.setString(2, UUID.randomUUID().toString()); insert.executeUpdate();
+                    insert.setString(1, "content_revision"); insert.setString(2, "0"); insert.executeUpdate();
+                }
+                createSchemaV2(connection);
+                return null;
+            });
         } else {
-            createSchemaV1(connection);
+            int parsed = parseSchemaVersion(version);
+            if (parsed > SCHEMA_VERSION) {
+                throw new SqliteJournalSchemaException("Unsupported future SQLite journal schema.");
+            }
+            if (parsed < OLDEST_SUPPORTED_SCHEMA_VERSION) {
+                throw new SqliteJournalSchemaException("Unsupported old SQLite journal schema.");
+            }
+            if (parsed == 1) {
+                String backupId = createMigrationBackup(connection, databasePath);
+                migrateV1ToV2(connection, backupId);
+            } else {
+                createSchemaV2(connection);
+            }
         }
         rebuildSearchDocuments(connection);
     }
 
-    private static void createSchemaV1(Connection connection) throws SQLException {
+    private static int parseSchemaVersion(String value) {
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException failure) {
+            throw new SqliteJournalSchemaException("Malformed SQLite journal schema metadata.");
+        }
+    }
+
+    /** Creates the v2 canonical tables and the compatibility read view. */
+    private static void createSchemaV2(Connection connection) throws SQLException {
         try (Statement statement = connection.createStatement()) {
-            statement.execute("CREATE TABLE IF NOT EXISTS journal_messages (sequence INTEGER PRIMARY KEY AUTOINCREMENT, player_uuid TEXT NOT NULL, player_name TEXT NOT NULL, message_text TEXT NOT NULL, captured_at_epoch_millis INTEGER NOT NULL, source TEXT NOT NULL, visibility TEXT NOT NULL, addressing_signal TEXT NOT NULL)");
+            statement.execute("CREATE TABLE IF NOT EXISTS journal_observations (sequence INTEGER PRIMARY KEY AUTOINCREMENT, player_uuid TEXT, captured_at_epoch_millis INTEGER NOT NULL, source TEXT NOT NULL, visibility TEXT NOT NULL, addressing_signal TEXT NOT NULL, raw_state TEXT NOT NULL CHECK(raw_state IN ('AVAILABLE', 'NOT_PERSISTED', 'EXPIRED', 'DELETED')), raw_unavailable_at_epoch_millis INTEGER)");
+            statement.execute("CREATE TABLE IF NOT EXISTS journal_observation_payloads (sequence INTEGER PRIMARY KEY REFERENCES journal_observations(sequence), player_name TEXT NOT NULL, message_text TEXT NOT NULL)");
+            statement.execute("CREATE VIEW IF NOT EXISTS journal_messages AS SELECT o.sequence, o.player_uuid, p.player_name, p.message_text, o.captured_at_epoch_millis, o.source, o.visibility, o.addressing_signal FROM journal_observations o JOIN journal_observation_payloads p ON p.sequence = o.sequence WHERE o.raw_state = 'AVAILABLE'");
             statement.execute("CREATE TABLE IF NOT EXISTS journal_batches (batch_id TEXT PRIMARY KEY, first_sequence INTEGER NOT NULL, last_sequence INTEGER NOT NULL, seal_reason TEXT NOT NULL, sealed_at_epoch_millis INTEGER NOT NULL)");
-            statement.execute("CREATE TABLE IF NOT EXISTS journal_batch_messages (batch_id TEXT NOT NULL REFERENCES journal_batches(batch_id), message_sequence INTEGER NOT NULL REFERENCES journal_messages(sequence), ordinal INTEGER NOT NULL, PRIMARY KEY(batch_id, message_sequence), UNIQUE(batch_id, ordinal))");
+            statement.execute("CREATE TABLE IF NOT EXISTS journal_batch_messages (batch_id TEXT NOT NULL REFERENCES journal_batches(batch_id), message_sequence INTEGER NOT NULL REFERENCES journal_observations(sequence), ordinal INTEGER NOT NULL, PRIMARY KEY(batch_id, message_sequence), UNIQUE(batch_id, ordinal))");
             statement.execute("CREATE TABLE IF NOT EXISTS journal_outcomes (batch_id TEXT PRIMARY KEY REFERENCES journal_batches(batch_id), provider_attempt_outcome TEXT NOT NULL, decision TEXT, refusal_code TEXT, delivery_status TEXT NOT NULL, delivered_response TEXT, completed_at_epoch_millis INTEGER NOT NULL)");
             statement.execute("CREATE TABLE IF NOT EXISTS memory_records (record_id TEXT PRIMARY KEY, record_type TEXT NOT NULL CHECK(record_type IN ('FACT', 'RELATIONSHIP')), record_state TEXT NOT NULL CHECK(record_state IN ('PROPOSED', 'CONFIRMED')), content TEXT NOT NULL CHECK(length(trim(content)) > 0), scope_type TEXT NOT NULL CHECK(scope_type IN ('WORLD', 'PLAYER')), scope_player_uuid TEXT, visibility TEXT NOT NULL CHECK(visibility IN ('PUBLIC', 'PRIVATE')), source_batch_id TEXT NOT NULL REFERENCES journal_batches(batch_id), first_sequence INTEGER NOT NULL, last_sequence INTEGER NOT NULL, source_timestamp_epoch_millis INTEGER NOT NULL, recorded_at_epoch_millis INTEGER NOT NULL, confidence REAL NOT NULL CHECK(confidence >= 0.0 AND confidence <= 1.0), importance REAL NOT NULL CHECK(importance >= 0.0 AND importance <= 1.0), relationship_subject_uuid TEXT, CHECK((scope_type = 'WORLD' AND scope_player_uuid IS NULL) OR (scope_type = 'PLAYER' AND scope_player_uuid IS NOT NULL)), CHECK((record_type = 'FACT' AND relationship_subject_uuid IS NULL) OR (record_type = 'RELATIONSHIP' AND relationship_subject_uuid IS NOT NULL)), CHECK(last_sequence >= first_sequence))");
             statement.execute("CREATE TABLE IF NOT EXISTS memory_confirmations (record_id TEXT PRIMARY KEY REFERENCES memory_records(record_id), authority TEXT NOT NULL CHECK(authority IN ('DETERMINISTIC_POLICY', 'AUTHORIZED_OPERATOR')), authority_identifier TEXT NOT NULL CHECK(length(trim(authority_identifier)) > 0), confirmed_at_epoch_millis INTEGER NOT NULL)");
@@ -1581,6 +1633,119 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
             statement.execute("CREATE TABLE IF NOT EXISTS memory_search_documents (document_id INTEGER PRIMARY KEY AUTOINCREMENT, record_type TEXT NOT NULL CHECK(record_type IN ('DIALOGUE', 'FACT', 'RELATIONSHIP', 'EVENT', 'SUMMARY')), stable_identity TEXT NOT NULL UNIQUE, content TEXT NOT NULL CHECK(length(trim(content)) > 0), scope_type TEXT NOT NULL CHECK(scope_type IN ('WORLD', 'PLAYER')), scope_player_uuid TEXT, visibility TEXT NOT NULL CHECK(visibility IN ('PUBLIC', 'PRIVATE')), first_sequence INTEGER NOT NULL, last_sequence INTEGER NOT NULL, source_timestamp_epoch_millis INTEGER NOT NULL, recorded_at_epoch_millis INTEGER NOT NULL, confidence REAL NOT NULL CHECK(confidence >= 0.0 AND confidence <= 1.0), importance REAL NOT NULL CHECK(importance >= 0.0 AND importance <= 1.0), source_batch_ids TEXT NOT NULL CHECK(length(trim(source_batch_ids)) > 0), CHECK((scope_type = 'WORLD' AND scope_player_uuid IS NULL) OR (scope_type = 'PLAYER' AND scope_player_uuid IS NOT NULL)), CHECK(last_sequence >= first_sequence))");
             statement.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_search_fts USING fts5(content, content='memory_search_documents', content_rowid='document_id')");
             statement.execute("CREATE INDEX IF NOT EXISTS memory_search_documents_scope_idx ON memory_search_documents(visibility, scope_type, scope_player_uuid, last_sequence)");
+            statement.execute("CREATE TABLE IF NOT EXISTS memory_compaction_batch_coverage (batch_id TEXT PRIMARY KEY REFERENCES journal_batches(batch_id), coverage_state TEXT NOT NULL CHECK(coverage_state IN ('COMPACTED', 'SKIPPED_UNAVAILABLE', 'SKIPPED_INVALIDATED')), recorded_at_epoch_millis INTEGER NOT NULL)");
+            statement.execute("CREATE TABLE IF NOT EXISTS storage_migration_history (migration_id TEXT PRIMARY KEY, from_version INTEGER NOT NULL, to_version INTEGER NOT NULL, backup_id TEXT NOT NULL, completed_at_epoch_millis INTEGER NOT NULL)");
+            statement.execute("CREATE TABLE IF NOT EXISTS retention_maintenance (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), last_sweep_at_epoch_millis INTEGER, last_result TEXT NOT NULL DEFAULT 'IDLE')");
+            statement.execute("INSERT OR IGNORE INTO retention_maintenance(singleton, last_result) VALUES (1, 'IDLE')");
+        }
+        ensureColumn(connection, "journal_batches", "source_state", "TEXT NOT NULL DEFAULT 'AVAILABLE'");
+        ensureColumn(connection, "journal_outcomes", "outcome_state", "TEXT NOT NULL DEFAULT 'ACTIVE'");
+        ensureColumn(connection, "journal_outcomes", "reply_state", "TEXT NOT NULL DEFAULT 'AVAILABLE'");
+        ensureColumn(connection, "memory_records", "provenance_availability", "TEXT NOT NULL DEFAULT 'AVAILABLE'");
+        ensureColumn(connection, "memory_events", "provenance_availability", "TEXT NOT NULL DEFAULT 'AVAILABLE'");
+        ensureColumn(connection, "memory_summary_versions", "provenance_availability", "TEXT NOT NULL DEFAULT 'AVAILABLE'");
+        ensureColumn(connection, "memory_current_situation_versions", "provenance_availability", "TEXT NOT NULL DEFAULT 'AVAILABLE'");
+    }
+
+    /** Migrates v1 without exposing a partially changed database as ready. */
+    private static void migrateV1ToV2(Connection connection, String backupId) throws SQLException {
+        withTransaction(connection, () -> {
+            try (Statement statement = connection.createStatement()) {
+                statement.execute("CREATE TABLE journal_observations (sequence INTEGER PRIMARY KEY AUTOINCREMENT, player_uuid TEXT, captured_at_epoch_millis INTEGER NOT NULL, source TEXT NOT NULL, visibility TEXT NOT NULL, addressing_signal TEXT NOT NULL, raw_state TEXT NOT NULL CHECK(raw_state IN ('AVAILABLE', 'NOT_PERSISTED', 'EXPIRED', 'DELETED')), raw_unavailable_at_epoch_millis INTEGER)");
+                statement.execute("CREATE TABLE journal_observation_payloads (sequence INTEGER PRIMARY KEY REFERENCES journal_observations(sequence), player_name TEXT NOT NULL, message_text TEXT NOT NULL)");
+                statement.execute("INSERT INTO journal_observations(sequence, player_uuid, captured_at_epoch_millis, source, visibility, addressing_signal, raw_state) SELECT sequence, player_uuid, captured_at_epoch_millis, source, visibility, addressing_signal, 'AVAILABLE' FROM journal_messages ORDER BY sequence");
+                statement.execute("INSERT INTO journal_observation_payloads(sequence, player_name, message_text) SELECT sequence, player_name, message_text FROM journal_messages ORDER BY sequence");
+                statement.execute("ALTER TABLE journal_batch_messages RENAME TO journal_batch_messages_v1");
+                statement.execute("ALTER TABLE journal_messages RENAME TO journal_messages_v1");
+                statement.execute("CREATE VIEW journal_messages AS SELECT o.sequence, o.player_uuid, p.player_name, p.message_text, o.captured_at_epoch_millis, o.source, o.visibility, o.addressing_signal FROM journal_observations o JOIN journal_observation_payloads p ON p.sequence = o.sequence WHERE o.raw_state = 'AVAILABLE'");
+                statement.execute("CREATE TABLE journal_batch_messages (batch_id TEXT NOT NULL REFERENCES journal_batches(batch_id), message_sequence INTEGER NOT NULL REFERENCES journal_observations(sequence), ordinal INTEGER NOT NULL, PRIMARY KEY(batch_id, message_sequence), UNIQUE(batch_id, ordinal))");
+                statement.execute("INSERT INTO journal_batch_messages(batch_id, message_sequence, ordinal) SELECT batch_id, message_sequence, ordinal FROM journal_batch_messages_v1");
+            }
+            createSchemaV2(connection);
+            try (Statement statement = connection.createStatement()) {
+                statement.execute("INSERT OR IGNORE INTO memory_compaction_batch_coverage(batch_id, coverage_state, recorded_at_epoch_millis) SELECT b.batch_id, 'COMPACTED', c.recorded_at_epoch_millis FROM journal_batches b JOIN memory_compaction_coverage c ON b.first_sequence >= c.first_sequence AND b.last_sequence <= c.last_sequence");
+                statement.execute("INSERT OR IGNORE INTO journal_metadata(key, value) VALUES ('content_revision', '0')");
+            }
+            verifyMigration(connection);
+            try (PreparedStatement history = connection.prepareStatement("INSERT INTO storage_migration_history(migration_id, from_version, to_version, backup_id, completed_at_epoch_millis) VALUES (?, 1, 2, ?, ?)" ); PreparedStatement version = connection.prepareStatement("UPDATE journal_metadata SET value = ? WHERE key = 'schema_version'")) {
+                history.setString(1, UUID.randomUUID().toString());
+                history.setString(2, backupId);
+                history.setLong(3, Instant.now().toEpochMilli());
+                history.executeUpdate();
+                version.setString(1, Integer.toString(SCHEMA_VERSION));
+                if (version.executeUpdate() != 1) throw new SQLException("Schema metadata was not updated.");
+            }
+            return null;
+        });
+    }
+
+    private static void ensureColumn(Connection connection, String table, String column, String definition) throws SQLException {
+        try (PreparedStatement columns = connection.prepareStatement("PRAGMA table_info(" + table + ")"); ResultSet rows = columns.executeQuery()) {
+            while (rows.next()) {
+                if (column.equals(rows.getString("name"))) return;
+            }
+        }
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition);
+        }
+    }
+
+    private static void verifyMigration(Connection connection) throws SQLException {
+        try (Statement statement = connection.createStatement(); ResultSet check = statement.executeQuery("PRAGMA foreign_key_check")) {
+            if (check.next()) throw new SQLException("SQLite foreign-key verification failed.");
+        }
+        try (Statement statement = connection.createStatement(); ResultSet rows = statement.executeQuery("SELECT count(*) FROM journal_observations")) {
+            if (!rows.next()) throw new SQLException("SQLite migration verification returned no count.");
+        }
+    }
+
+    /** Uses SQLite's snapshot-aware VACUUM INTO rather than copying a live WAL database. */
+    private static String createMigrationBackup(Connection connection, Path databasePath) throws SQLException, IOException {
+        Path databaseRoot = databasePath.getParent();
+        if (databaseRoot == null || Files.isSymbolicLink(databaseRoot)) {
+            throw new SqliteJournalSchemaException("Unsafe storage backup root.");
+        }
+        Path backupRoot = databaseRoot.resolve("backups").resolve("storage").normalize();
+        if (!backupRoot.startsWith(databaseRoot) || Files.exists(backupRoot) && Files.isSymbolicLink(backupRoot)) {
+            throw new SqliteJournalSchemaException("Unsafe storage backup path.");
+        }
+        Files.createDirectories(backupRoot);
+        String backupId = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC).format(Instant.now())
+            + "-" + UUID.randomUUID();
+        Path temporary = backupRoot.resolve("." + backupId + ".tmp.sqlite3");
+        Path published = backupRoot.resolve(backupId + ".sqlite3");
+        if (Files.exists(temporary) || Files.exists(published)) throw new IOException("Storage backup collision.");
+        try {
+            try (Statement statement = connection.createStatement()) {
+                statement.execute("VACUUM INTO '" + temporary.toString().replace("'", "''") + "'");
+            }
+            forceFile(temporary);
+            validateBackup(temporary);
+            try {
+                Files.move(temporary, published, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException unavailable) {
+                Files.move(temporary, published);
+            }
+            return backupId;
+        } catch (SQLException | IOException failure) {
+            Files.deleteIfExists(temporary);
+            throw failure;
+        }
+    }
+
+    private static void validateBackup(Path backup) throws SQLException, IOException {
+        try (Connection snapshot = DriverManager.getConnection("jdbc:sqlite:" + backup.toAbsolutePath().normalize()); Statement statement = snapshot.createStatement()) {
+            try (ResultSet quickCheck = statement.executeQuery("PRAGMA quick_check")) {
+                if (!quickCheck.next() || !"ok".equalsIgnoreCase(quickCheck.getString(1))) throw new SQLException("Storage backup validation failed.");
+            }
+            String version = metadata(snapshot, "schema_version");
+            if (!"1".equals(version) || metadata(snapshot, "world_id") == null) throw new SQLException("Storage backup metadata validation failed.");
+        }
+    }
+
+    private static void forceFile(Path path) throws IOException {
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
+            channel.force(true);
         }
     }
 
@@ -1623,6 +1788,10 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
     }
 
     private <T> T withTransaction(SqlSupplier<T> work) throws SQLException {
+        return withTransaction(connection, work);
+    }
+
+    private static <T> T withTransaction(Connection connection, SqlSupplier<T> work) throws SQLException {
         boolean originalAutoCommit = connection.getAutoCommit();
         connection.setAutoCommit(false);
         try {

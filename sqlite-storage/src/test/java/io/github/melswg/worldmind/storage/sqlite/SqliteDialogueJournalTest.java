@@ -20,6 +20,9 @@ import io.github.melswg.worldmind.core.journal.JournalParticipationDecision;
 import io.github.melswg.worldmind.core.journal.ProviderAttemptOutcome;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
@@ -66,6 +69,23 @@ class SqliteDialogueJournalTest {
         assertEquals(3L, join(reopened.appendObservation(message("After restart", AddressingSignal.NONE))).sequence());
         join(reopened.closeAsync());
         assertFalse(new String(Files.readAllBytes(database)).contains("WORLDMIND_ACCEPTANCE_KEY"));
+    }
+
+    @Test
+    void migratesPopulatedV1WithVacuumBackupWithoutChangingIdentityOrSequence() throws Exception {
+        Path database = temporaryDirectory.resolve("legacy/worldmind/" + SqliteDialogueJournal.DATABASE_FILE_NAME);
+        Files.createDirectories(database.getParent());
+        UUID batchId = UUID.fromString("7dc96eea-2a6f-43e2-9c1c-583165d0cc9d");
+        UUID legacyWorld = UUID.fromString("f5c3a20e-721b-490c-bb7c-93179a1ce110");
+        createV1Fixture(database, legacyWorld, batchId);
+
+        SqliteDialogueJournal migrated = open(database);
+        assertEquals(2, migrated.openedSchemaVersion());
+        assertEquals("world-" + legacyWorld, migrated.openedWorldIdentity().stableId());
+        assertEquals(List.of(1L), join(migrated.readSnapshot()).observations().stream().map(value -> value.sequence()).toList());
+        assertEquals(2L, join(migrated.appendObservation(message("after migration", AddressingSignal.NONE))).sequence());
+        assertFalse(Files.list(database.getParent().resolve("backups/storage")).findAny().isEmpty());
+        join(migrated.closeAsync());
     }
 
     @Test
@@ -136,6 +156,31 @@ class SqliteDialogueJournalTest {
 
     private CapturedPublicChatMessage message(String text, AddressingSignal signal) {
         return new CapturedPublicChatMessage(MIRA, text, signal, Instant.EPOCH, List.of());
+    }
+
+    private static void createV1Fixture(Path database, UUID worldId, UUID batchId) throws Exception {
+        try (Connection connection = DriverManager.getConnection("jdbc:sqlite:" + database); Statement statement = connection.createStatement()) {
+            statement.execute("CREATE TABLE journal_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+            statement.execute("INSERT INTO journal_metadata VALUES ('schema_version', '1')");
+            statement.execute("INSERT INTO journal_metadata VALUES ('world_id', '" + worldId + "')");
+            statement.execute("CREATE TABLE journal_messages (sequence INTEGER PRIMARY KEY AUTOINCREMENT, player_uuid TEXT NOT NULL, player_name TEXT NOT NULL, message_text TEXT NOT NULL, captured_at_epoch_millis INTEGER NOT NULL, source TEXT NOT NULL, visibility TEXT NOT NULL, addressing_signal TEXT NOT NULL)");
+            statement.execute("CREATE TABLE journal_batches (batch_id TEXT PRIMARY KEY, first_sequence INTEGER NOT NULL, last_sequence INTEGER NOT NULL, seal_reason TEXT NOT NULL, sealed_at_epoch_millis INTEGER NOT NULL)");
+            statement.execute("CREATE TABLE journal_batch_messages (batch_id TEXT NOT NULL, message_sequence INTEGER NOT NULL, ordinal INTEGER NOT NULL, PRIMARY KEY(batch_id, message_sequence), UNIQUE(batch_id, ordinal))");
+            statement.execute("CREATE TABLE journal_outcomes (batch_id TEXT PRIMARY KEY, provider_attempt_outcome TEXT NOT NULL, decision TEXT, refusal_code TEXT, delivery_status TEXT NOT NULL, delivered_response TEXT, completed_at_epoch_millis INTEGER NOT NULL)");
+            statement.execute("CREATE TABLE memory_records (record_id TEXT PRIMARY KEY, record_type TEXT, record_state TEXT, content TEXT, scope_type TEXT, scope_player_uuid TEXT, visibility TEXT, source_batch_id TEXT, first_sequence INTEGER, last_sequence INTEGER, source_timestamp_epoch_millis INTEGER, recorded_at_epoch_millis INTEGER, confidence REAL, importance REAL, relationship_subject_uuid TEXT)");
+            statement.execute("CREATE TABLE memory_confirmations (record_id TEXT PRIMARY KEY, authority TEXT, authority_identifier TEXT, confirmed_at_epoch_millis INTEGER)");
+            statement.execute("CREATE TABLE memory_events (event_id TEXT PRIMARY KEY, content TEXT, scope_type TEXT, scope_player_uuid TEXT, visibility TEXT, first_sequence INTEGER, last_sequence INTEGER, source_timestamp_epoch_millis INTEGER, recorded_at_epoch_millis INTEGER, confidence REAL, importance REAL)");
+            statement.execute("CREATE TABLE memory_summary_versions (summary_version_id TEXT PRIMARY KEY, summary_series_id TEXT, version_number INTEGER, content TEXT, scope_type TEXT, scope_player_uuid TEXT, visibility TEXT, first_sequence INTEGER, last_sequence INTEGER, source_timestamp_epoch_millis INTEGER, recorded_at_epoch_millis INTEGER, confidence REAL, importance REAL)");
+            statement.execute("CREATE TABLE memory_current_situation_versions (situation_version_id TEXT PRIMARY KEY, situation_series_id TEXT, version_number INTEGER, content TEXT, scope_type TEXT, scope_player_uuid TEXT, visibility TEXT, first_sequence INTEGER, last_sequence INTEGER, source_timestamp_epoch_millis INTEGER, recorded_at_epoch_millis INTEGER, confidence REAL, importance REAL)");
+            statement.execute("CREATE TABLE memory_derived_sources (record_kind TEXT, record_id TEXT, batch_id TEXT, ordinal INTEGER)");
+            statement.execute("CREATE TABLE memory_compaction_coverage (first_sequence INTEGER, last_sequence INTEGER, recorded_at_epoch_millis INTEGER)");
+            statement.execute("CREATE TABLE memory_search_documents (document_id INTEGER PRIMARY KEY AUTOINCREMENT, record_type TEXT, stable_identity TEXT, content TEXT, scope_type TEXT, scope_player_uuid TEXT, visibility TEXT, first_sequence INTEGER, last_sequence INTEGER, source_timestamp_epoch_millis INTEGER, recorded_at_epoch_millis INTEGER, confidence REAL, importance REAL, source_batch_ids TEXT)");
+            statement.execute("CREATE VIRTUAL TABLE memory_search_fts USING fts5(content, content='memory_search_documents', content_rowid='document_id')");
+            statement.execute("INSERT INTO journal_messages(player_uuid, player_name, message_text, captured_at_epoch_millis, source, visibility, addressing_signal) VALUES ('" + MIRA.playerId() + "', 'Mira', 'legacy raw', 0, 'PUBLIC_CHAT', 'PUBLIC', 'NONE')");
+            statement.execute("INSERT INTO journal_batches VALUES ('" + batchId + "', 1, 1, 'ADDRESSING_SIGNAL', 0)");
+            statement.execute("INSERT INTO journal_batch_messages VALUES ('" + batchId + "', 1, 0)");
+            statement.execute("INSERT INTO journal_outcomes VALUES ('" + batchId + "', 'SUCCEEDED', 'DIRECT_REPLY', NULL, 'PUBLIC_REPLY_DELIVERED', 'legacy reply', 0)");
+        }
     }
 
     private static <T> T join(java.util.concurrent.CompletionStage<T> stage) {
