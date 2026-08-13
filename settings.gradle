@@ -11,4 +11,4 @@ pluginManagement {
 
 rootProject.name = "worldmind"
 
-include("core", "fabric-1.20.1", "sqlite-storage", "testkit")
+include("core", "fabric-1.20.1", "sqlite-storage", "testkit", "game-context-api", "game-context-runtime")

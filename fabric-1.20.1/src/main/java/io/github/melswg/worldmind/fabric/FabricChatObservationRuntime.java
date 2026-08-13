@@ -24,6 +24,7 @@ import io.github.melswg.worldmind.core.conversation.RefusalCode;
 import io.github.melswg.worldmind.core.conversation.RetryingLanguageModel;
 import io.github.melswg.worldmind.core.conversation.JitterSource;
 import io.github.melswg.worldmind.core.conversation.CircuitBreakingLanguageModel;
+import io.github.melswg.worldmind.core.conversation.CurrentGameContextResolver;
 import io.github.melswg.worldmind.core.conversation.ProviderCircuitBreaker;
 import io.github.melswg.worldmind.core.conversation.ProviderCircuitSnapshot;
 import io.github.melswg.worldmind.core.conversation.RetrySnapshot;
@@ -93,7 +94,8 @@ final class FabricChatObservationRuntime implements AutoCloseable {
         ValidatedWorldmindConfiguration configuration,
         LanguageModel languageModel,
         ProviderCapabilities providerCapabilities,
-        FabricChatDiagnostics diagnostics
+        FabricChatDiagnostics diagnostics,
+        CurrentGameContextResolver currentGameContextResolver
     ) {
         FabricDelayedScheduler delayedScheduler = new FabricDelayedScheduler();
         try {
@@ -126,7 +128,8 @@ final class FabricChatObservationRuntime implements AutoCloseable {
                     serverScheduler,
                     journal instanceof WorldMemoryRepository memoryRepository
                         ? memoryRepository
-                        : WorldMemoryRepository.empty()
+                        : WorldMemoryRepository.empty(),
+                    currentGameContextResolver
                 ),
                 providerCapabilities,
                 new FabricServerChatSink(server),

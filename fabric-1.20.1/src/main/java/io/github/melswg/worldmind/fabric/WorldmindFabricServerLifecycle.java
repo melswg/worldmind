@@ -31,6 +31,7 @@ import io.github.melswg.worldmind.core.configuration.EnabledWorldmindIntegration
 import io.github.melswg.worldmind.core.configuration.IntegrationDisableReason;
 import io.github.melswg.worldmind.core.configuration.WorldmindIntegrationState;
 import io.github.melswg.worldmind.core.conversation.CapturedPublicChatMessage;
+import io.github.melswg.worldmind.core.conversation.CurrentGameContextResolver;
 import io.github.melswg.worldmind.core.conversation.ProviderCapabilities;
 import io.github.melswg.worldmind.core.conversation.ProviderCircuitSnapshot;
 import io.github.melswg.worldmind.core.conversation.WorldIdentity;
@@ -39,6 +40,7 @@ import io.github.melswg.worldmind.fabric.provider.BuiltInProviderPresetRegistry;
 import io.github.melswg.worldmind.fabric.provider.EnvironmentProviderCredentialResolver;
 import io.github.melswg.worldmind.fabric.provider.ProviderCredentialResolver;
 import io.github.melswg.worldmind.fabric.provider.ProviderRuntimeHandle;
+import io.github.melswg.worldmind.gamecontext.internal.GameContextExtensionRuntime;
 import io.github.melswg.worldmind.storage.sqlite.SqliteDialogueJournal;
 import java.nio.file.Path;
 import java.time.Clock;
@@ -90,6 +92,8 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
     private final Map<String, PendingConfirmation> confirmations = new LinkedHashMap<>();
 
     private WorldmindAuthoritativeRuntime runtime;
+    private GameContextExtensionRuntime gameContextRuntime;
+    private CurrentGameContextResolver currentGameContextResolver = CurrentGameContextResolver.vanillaOnly();
     private WorldmindIntegrationState integrationState;
     private FabricChatObservationRuntime chatObservation;
     private ProviderRuntimeHandle providerRuntime;
@@ -161,8 +165,16 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
     }
 
     synchronized void onServerStarted(MinecraftServer startedServer) {
+        onServerStarted(startedServer, null);
+    }
+
+    synchronized void onServerStarted(MinecraftServer startedServer, GameContextExtensionRuntime gameContextRuntime) {
         invalidateConfirmations();
         retireCurrentGeneration(true);
+        this.gameContextRuntime = gameContextRuntime;
+        this.currentGameContextResolver = gameContextRuntime == null
+            ? CurrentGameContextResolver.vanillaOnly()
+            : gameContextRuntime;
         server = startedServer;
         saveRoot = startedServer == null ? null : startedServer.getSavePath(WorldSavePath.ROOT);
         long generation = ++lifecycleGeneration;
@@ -529,7 +541,8 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
                 enabled.configuration(),
                 providerRuntime.languageModel(),
                 providerRuntime.capabilities(),
-                this::logDeliveryDiagnostic
+                this::logDeliveryDiagnostic,
+                currentGameContextResolver
             );
             chatObservation = created;
             pendingJournalStart = null;
@@ -579,7 +592,10 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
                 pendingJournalStart = null;
             }
             CompletionStage<Void> barrier = retiring == null ? CompletableFuture.completedFuture(null) : retiring.retireForReload();
-            barrier.whenComplete((ignored, failure) -> schedule(target, newGeneration, () -> {
+            CompletionStage<Void> contextReload = gameContextRuntime == null
+                ? CompletableFuture.completedFuture(null)
+                : gameContextRuntime.onReload(newGeneration);
+            barrier.thenCompose(ignored -> contextReload).whenComplete((ignored, failure) -> schedule(target, newGeneration, () -> {
                 synchronized (this) {
                     if (newGeneration != lifecycleGeneration || lifecycleState != RuntimeLifecycleState.RUNNING) {
                         completeReload(result, ReloadResult.of(AdministrationResultCode.CANCELLED));

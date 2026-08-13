@@ -15,11 +15,15 @@ import org.junit.jupiter.api.Test;
 
 class FabricArtifactPackagingTest {
     @Test
-    void remappedFabricArtifactNestsSqliteJdbcWithWindowsMacAndLinuxNativeLibraries() throws Exception {
+    void remappedFabricArtifactNestsPublicGameContextApiAndItsPrivateRuntime() throws Exception {
         String artifactPath = System.getenv("WORLDMIND_REMAPPED_JAR");
         assumeTrue(artifactPath != null && !artifactPath.isBlank(),
             "Set WORLDMIND_REMAPPED_JAR to verify the built Fabric artifact.");
         try (ZipFile outer = new ZipFile(Path.of(artifactPath).toFile())) {
+            assertNotNull(outer.getEntry("META-INF/jars/game-context-api-0.1.0-SNAPSHOT.jar"),
+                "The Fabric artifact must nest the public game-context API.");
+            assertNotNull(outer.getEntry("META-INF/jars/game-context-runtime-0.1.0-SNAPSHOT.jar"),
+                "The Fabric artifact must nest the internal game-context runtime.");
             ZipEntry nestedJdbc = outer.getEntry("META-INF/jars/sqlite-jdbc-3.53.1.0.jar");
             assertNotNull(nestedJdbc, "The Fabric artifact must nest sqlite-jdbc.");
             Set<String> entries = new HashSet<>();

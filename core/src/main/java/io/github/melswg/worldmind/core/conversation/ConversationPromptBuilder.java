@@ -11,9 +11,14 @@ import java.util.Optional;
 
 /** Builds the fixed v1 prompt structure independently of provider transport details. */
 final class ConversationPromptBuilder {
-    Optional<ProviderRequest> build(NormalizedServerRequest request, RetrievedMemoryContext recalledMemory) {
+    Optional<ProviderRequest> build(
+        NormalizedServerRequest request,
+        RetrievedMemoryContext recalledMemory,
+        List<UntrustedContext> currentGameContext
+    ) {
         Objects.requireNonNull(request, "request");
         recalledMemory = Objects.requireNonNull(recalledMemory, "recalledMemory");
+        currentGameContext = List.copyOf(Objects.requireNonNull(currentGameContext, "currentGameContext"));
         WorldmindProfile profile = request.validatedConfiguration().profile();
         List<PromptLayer> layers = new ArrayList<>();
         layers.add(new PromptLayer(
@@ -47,7 +52,7 @@ final class ConversationPromptBuilder {
         layers.add(new PromptLayer(
             PromptLayerType.CURRENT_GAME_CONTEXT,
             PromptTrust.UNTRUSTED_DATA,
-            request.chatBatch().currentContextSnapshot().stream().map(this::contextFragment).toList()
+            currentGameContext.stream().map(this::contextFragment).toList()
         ));
         layers.add(new PromptLayer(
             PromptLayerType.CURRENT_CHAT_BATCH,
