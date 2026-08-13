@@ -9,6 +9,8 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Objects;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -26,7 +28,8 @@ public final class FakeOpenAiCompatibleHttpServer implements AutoCloseable {
     private final HttpServer server;
     private final CompletableFuture<CapturedRequest> receivedRequest = new CompletableFuture<>();
     private final BlockingQueue<CapturedRequest> receivedRequests = new LinkedBlockingQueue<>();
-    private final AtomicReference<Response> response = new AtomicReference<>(new Response(200, "{}"));
+    private final AtomicReference<Response> response = new AtomicReference<>(new Response(200, "{}", Map.of(), false));
+    private final BlockingQueue<Response> scriptedResponses = new LinkedBlockingQueue<>();
     private final AtomicReference<CountDownLatch> responseGate = new AtomicReference<>(new CountDownLatch(0));
     private volatile String expectedAuthorization;
 
@@ -52,7 +55,17 @@ public final class FakeOpenAiCompatibleHttpServer implements AutoCloseable {
     }
 
     public void respondWith(int statusCode, String body) {
-        response.set(new Response(statusCode, Objects.requireNonNull(body, "body")));
+        response.set(new Response(statusCode, Objects.requireNonNull(body, "body"), Map.of(), false));
+    }
+
+    /** Queues one synthetic response for deterministic retry and error contracts. */
+    public void enqueueResponse(int statusCode, String body, Map<String, String> headers) {
+        scriptedResponses.add(new Response(statusCode, Objects.requireNonNull(body, "body"), Map.copyOf(headers), false));
+    }
+
+    /** Makes one accepted request fail at the transport boundary without exposing a body. */
+    public void enqueueConnectionClose() {
+        scriptedResponses.add(new Response(0, "", Map.of(), true));
     }
 
     public void holdResponses() {
@@ -102,6 +115,7 @@ public final class FakeOpenAiCompatibleHttpServer implements AutoCloseable {
             exchange.getRequestHeaders().getFirst("Accept"),
             authorization != null,
             authorizationMatchesExpected,
+            exchange.getRequestHeaders().keySet().stream().map(String::toLowerCase).collect(java.util.stream.Collectors.toUnmodifiableSet()),
             new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)
         );
         receivedRequest.complete(captured);
@@ -115,9 +129,15 @@ public final class FakeOpenAiCompatibleHttpServer implements AutoCloseable {
             return;
         }
 
-        Response configuredResponse = response.get();
+        Response configuredResponse = scriptedResponses.poll();
+        if (configuredResponse == null) configuredResponse = response.get();
+        if (configuredResponse.closeConnection()) {
+            exchange.close();
+            return;
+        }
         byte[] responseBody = configuredResponse.body().getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "application/json");
+        configuredResponse.headers().forEach((name, value) -> exchange.getResponseHeaders().set(name, value));
         exchange.sendResponseHeaders(configuredResponse.statusCode(), responseBody.length);
         exchange.getResponseBody().write(responseBody);
         exchange.close();
@@ -137,10 +157,11 @@ public final class FakeOpenAiCompatibleHttpServer implements AutoCloseable {
         String accept,
         boolean authorizationPresent,
         boolean authorizationMatchesExpected,
+        Set<String> headerNames,
         String body
     ) {
     }
 
-    private record Response(int statusCode, String body) {
+    private record Response(int statusCode, String body, Map<String, String> headers, boolean closeConnection) {
     }
 }

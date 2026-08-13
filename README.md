@@ -11,6 +11,10 @@ loading with backups, redaction, retry/circuit protection, and three supported
 Chat Completions provider presets: custom OpenAI-compatible, OpenRouter, and
 direct DeepSeek.
 
+Required tests use only a loopback fake provider with synthetic credentials;
+Worldmind ships no real-provider smoke task and never discovers user credentials
+automatically.
+
 ## Target platform
 
 - Minecraft 1.20.1

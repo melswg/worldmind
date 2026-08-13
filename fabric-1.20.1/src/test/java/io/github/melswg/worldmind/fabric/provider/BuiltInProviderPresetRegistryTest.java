@@ -74,6 +74,26 @@ class BuiltInProviderPresetRegistryTest {
         }
     }
 
+    @Test
+    void retainsOnlyTheSafeOpenRouterRetryAfterHint() throws Exception {
+        try (FakeOpenAiCompatibleHttpServer server = new FakeOpenAiCompatibleHttpServer()) {
+            server.enqueueResponse(429, "{\"error\":{\"code\":429,\"message\":\"synthetic\"}}", java.util.Map.of("Retry-After", "2"));
+            ProviderPresetDescriptor descriptor = BuiltInProviderPresetRegistry.standard().descriptor(ProviderPresetDescriptor.OPENROUTER);
+            ProviderConfiguration configuration = new ProviderConfiguration(
+                ProviderPresetDescriptor.OPENROUTER, Optional.empty(), "openai/gpt-4", generation(),
+                new ExternalSecretReference("env:WORLD_TEST"), ProviderTimeoutConfiguration.DEFAULT,
+                ProviderRetryConfiguration.DEFAULT, ProviderCircuitBreakerConfiguration.DEFAULT
+            );
+            ChatCompletionsLanguageModel model = new ChatCompletionsLanguageModel(configuration, descriptor,
+                server.endpoint("/chat/completions"), HttpClient.newHttpClient(), new FixedCredentialResolver("synthetic"),
+                new AtomicReference<>(io.github.melswg.worldmind.core.administration.ProviderAvailability.READY));
+
+            var failure = assertInstanceOf(io.github.melswg.worldmind.core.conversation.ProviderFailure.class,
+                model.complete(request()).toCompletableFuture().get());
+            assertEquals(Optional.of(Duration.ofSeconds(2)), failure.retryAfter());
+        }
+    }
+
     private static GenerationParameters generation() {
         return new GenerationParameters(Optional.of(0.3), Optional.empty(), Optional.of(120));
     }

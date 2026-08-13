@@ -16,14 +16,18 @@ import io.github.melswg.worldmind.core.conversation.RefusalCode;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Flow;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** One asynchronous, cancellable transport for all built-in Chat Completions presets. */
@@ -66,7 +70,7 @@ final class ChatCompletionsLanguageModel implements LanguageModel {
                 .header("Accept", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(descriptor.serialize(request, promptRenderer), StandardCharsets.UTF_8))
                 .build();
-            CompletableFuture<HttpResponse<String>> wire = httpClient.sendAsync(outgoing, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            CompletableFuture<HttpResponse<String>> wire = httpClient.sendAsync(outgoing, ignored -> new LimitedUtf8BodySubscriber());
             if (wire == null) return CompletableFuture.completedFuture(new ProviderFailure(ProviderFailureKind.CONNECTION_FAILURE));
             CompletableFuture<LanguageModelResult> mapped = new CompletableFuture<>();
             wire.whenComplete((response, failure) -> mapped.complete(mapResponse(response, failure)));
@@ -92,11 +96,12 @@ final class ChatCompletionsLanguageModel implements LanguageModel {
     private LanguageModelResult mapResponse(HttpResponse<String> response, Throwable failure) {
         if (failure != null) {
             if (isCancellation(failure)) return new ProviderFailure(ProviderFailureKind.CANCELLED);
+            if (hasCause(failure, ResponseTooLargeException.class)) return new ProviderFailure(ProviderFailureKind.OVERSIZED_CONTENT);
             return new ProviderFailure(failureKind(failure));
         }
         if (response == null) return new ProviderFailure(ProviderFailureKind.CONNECTION_FAILURE);
         String body = response.body();
-        if (body == null || body.getBytes(StandardCharsets.UTF_8).length > MAX_RESPONSE_BYTES) {
+        if (body == null) {
             return new ProviderFailure(ProviderFailureKind.OVERSIZED_CONTENT);
         }
         Optional<JsonObject> parsed = parseObject(body);
@@ -134,5 +139,65 @@ final class ChatCompletionsLanguageModel implements LanguageModel {
         Throwable failure = thrown;
         while ((failure instanceof CompletionException || failure instanceof ExecutionException) && failure.getCause() != null) failure = failure.getCause();
         return failure instanceof java.util.concurrent.CancellationException;
+    }
+
+    private boolean hasCause(Throwable thrown, Class<? extends Throwable> type) {
+        Throwable current = thrown;
+        while (current != null) {
+            if (type.isInstance(current)) return true;
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    /** Cancels the HTTP subscription as soon as the configured bounded body limit is exceeded. */
+    private static final class LimitedUtf8BodySubscriber implements HttpResponse.BodySubscriber<String> {
+        private final CompletableFuture<String> body = new CompletableFuture<>();
+        private final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        private Flow.Subscription subscription;
+
+        @Override
+        public CompletionStage<String> getBody() {
+            return body;
+        }
+
+        @Override
+        public void onSubscribe(Flow.Subscription subscription) {
+            this.subscription = subscription;
+            subscription.request(1);
+        }
+
+        @Override
+        public void onNext(List<ByteBuffer> buffers) {
+            if (body.isDone()) return;
+            for (ByteBuffer buffer : buffers) {
+                int remaining = buffer.remaining();
+                if (bytes.size() > MAX_RESPONSE_BYTES - remaining) {
+                    subscription.cancel();
+                    body.completeExceptionally(new ResponseTooLargeException());
+                    return;
+                }
+                byte[] next = new byte[remaining];
+                buffer.get(next);
+                bytes.write(next, 0, next.length);
+            }
+            subscription.request(1);
+        }
+
+        @Override
+        public void onError(Throwable failure) {
+            body.completeExceptionally(failure);
+        }
+
+        @Override
+        public void onComplete() {
+            body.complete(new String(bytes.toByteArray(), StandardCharsets.UTF_8));
+        }
+    }
+
+    private static final class ResponseTooLargeException extends RuntimeException {
+        private ResponseTooLargeException() {
+            super(null, null, false, false);
+        }
     }
 }

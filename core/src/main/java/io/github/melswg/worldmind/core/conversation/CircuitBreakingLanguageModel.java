@@ -24,12 +24,36 @@ public final class CircuitBreakingLanguageModel implements LanguageModel {
                 stage = CompletableFuture.completedFuture(new ProviderFailure(ProviderFailureKind.CONNECTION_FAILURE));
             }
             if (stage == null) stage = CompletableFuture.completedFuture(new ProviderFailure(ProviderFailureKind.CONNECTION_FAILURE));
-            return stage.handle((result, failure) -> {
-                LanguageModelResult resolved = failure == null && result != null ? result
+            CompletionStage<LanguageModelResult> delegateStage = stage;
+            CompletableFuture<LanguageModelResult> result = new CompletableFuture<>();
+            result.whenComplete((ignored, failure) -> {
+                if (result.isCancelled()) {
+                    breaker.release(permit);
+                    try { delegateStage.toCompletableFuture().cancel(true); } catch (RuntimeException ignoredFailure) { }
+                }
+            });
+            stage.whenComplete((value, failure) -> {
+                if (result.isDone()) return;
+                if (isCancellation(failure) || value instanceof ProviderFailure providerFailure
+                    && providerFailure.kind() == ProviderFailureKind.CANCELLED) {
+                    result.cancel(false);
+                    return;
+                }
+                LanguageModelResult resolved = failure == null && value != null ? value
                     : new ProviderFailure(ProviderFailureKind.CONNECTION_FAILURE);
                 breaker.record(permit, resolved);
-                return resolved;
+                result.complete(resolved);
             });
+            return result;
         }).orElseGet(() -> CompletableFuture.completedFuture(new ProviderRefusal(RefusalCode.PROVIDER_CIRCUIT_OPEN)));
+    }
+
+    private boolean isCancellation(Throwable failure) {
+        Throwable current = failure;
+        while ((current instanceof java.util.concurrent.CompletionException
+            || current instanceof java.util.concurrent.ExecutionException) && current.getCause() != null) {
+            current = current.getCause();
+        }
+        return current instanceof java.util.concurrent.CancellationException;
     }
 }

@@ -82,6 +82,40 @@ class RetryingLanguageModelTest {
         assertEquals(1, transientCalls.get());
     }
 
+    @Test
+    void honorsSafeServerRetryAfterHintsWithoutRetryingBeforeTheAdvertisedDelay() {
+        ControlledClock clock = ControlledClock.startingAt(Instant.EPOCH);
+        DeterministicScheduler scheduler = new DeterministicScheduler(clock);
+        AtomicInteger delayedCalls = new AtomicInteger();
+        RetryingLanguageModel delayed = new RetryingLanguageModel(
+            ignored -> CompletableFuture.completedFuture(delayedCalls.incrementAndGet() == 1
+                ? new ProviderFailure(ProviderFailureKind.HTTP_RATE_LIMITED, Optional.of(Duration.ofMillis(300)))
+                : new ProviderResponse("DIRECT_REPLY\nrecovered")),
+            new ProviderRetryConfiguration(2, 100, 1_000, 0.0), scheduler, () -> 0.0
+        );
+        delayed.complete(request());
+        clock.advanceBy(Duration.ofMillis(299));
+        scheduler.runDueTasks();
+        assertEquals(1, delayedCalls.get());
+        clock.advanceBy(Duration.ofMillis(1));
+        scheduler.runDueTasks();
+        assertEquals(2, delayedCalls.get());
+
+        AtomicInteger cappedCalls = new AtomicInteger();
+        RetryingLanguageModel capped = new RetryingLanguageModel(
+            ignored -> {
+                cappedCalls.incrementAndGet();
+                return CompletableFuture.completedFuture(new ProviderFailure(ProviderFailureKind.HTTP_RATE_LIMITED,
+                    Optional.of(Duration.ofMillis(1_001))));
+            },
+            new ProviderRetryConfiguration(2, 100, 1_000, 0.0), scheduler, () -> 0.0
+        );
+        capped.complete(request());
+        clock.advanceBy(Duration.ofSeconds(2));
+        scheduler.runDueTasks();
+        assertEquals(1, cappedCalls.get(), "the configured maximum must prevent an early retry");
+    }
+
     private ProviderRequest request() {
         return new ProviderRequest("test", new GenerationParameters(Optional.empty(), Optional.empty(), Optional.empty()),
             List.of(new io.github.melswg.worldmind.core.conversation.PromptLayer(

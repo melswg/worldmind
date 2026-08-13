@@ -41,6 +41,12 @@ public final class ProviderCircuitBreaker {
         if (result instanceof ProviderResponse || result instanceof ProviderRefusal) close();
     }
 
+    /** Releases an abandoned half-open probe without turning cancellation into a provider failure. */
+    public synchronized void release(Permit permit) {
+        Objects.requireNonNull(permit, "permit");
+        if (permit.probe()) probeInFlight = false;
+    }
+
     public synchronized ProviderCircuitSnapshot snapshot() {
         return new ProviderCircuitSnapshot(state, failures, Optional.ofNullable(cooldownUntil), probeInFlight);
     }

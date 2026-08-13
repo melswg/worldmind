@@ -48,6 +48,26 @@ class ProviderCircuitBreakerTest {
         assertTrue(breaker.snapshot().cooldownUntil().isEmpty());
     }
 
+    @Test
+    void cancellationDoesNotCountAsFailureAndReleasesTheHalfOpenProbe() {
+        ControlledClock clock = ControlledClock.startingAt(Instant.EPOCH);
+        CompletableFuture<io.github.melswg.worldmind.core.conversation.LanguageModelResult> pending = new CompletableFuture<>();
+        LanguageModel failing = ignored -> CompletableFuture.completedFuture(new ProviderFailure(ProviderFailureKind.HTTP_SERVER_ERROR));
+        LanguageModel pendingProbe = ignored -> pending;
+        ProviderCircuitBreaker breaker = new ProviderCircuitBreaker(new ProviderCircuitBreakerConfiguration(1, 1_000), clock);
+        CircuitBreakingLanguageModel guarded = new CircuitBreakingLanguageModel(failing, pendingProbe, breaker);
+
+        guarded.complete(request()).toCompletableFuture().join();
+        assertEquals(ProviderCircuitState.OPEN, breaker.snapshot().state());
+        clock.advanceBy(Duration.ofMillis(1_000));
+
+        CompletableFuture<io.github.melswg.worldmind.core.conversation.LanguageModelResult> cancelled = guarded.complete(request()).toCompletableFuture();
+        assertTrue(cancelled.cancel(true));
+        assertEquals(ProviderCircuitState.HALF_OPEN, breaker.snapshot().state());
+        assertFalse(breaker.snapshot().probeInFlight());
+        assertEquals(1, breaker.snapshot().consecutiveQualifyingFailures());
+    }
+
     private ProviderRequest request() {
         return new ProviderRequest("test", new GenerationParameters(Optional.empty(), Optional.empty(), Optional.empty()), List.of(
             new io.github.melswg.worldmind.core.conversation.PromptLayer(
