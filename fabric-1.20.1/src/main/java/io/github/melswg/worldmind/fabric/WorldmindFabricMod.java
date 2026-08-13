@@ -1,6 +1,7 @@
 package io.github.melswg.worldmind.fabric;
 
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.message.v1.ServerMessageEvents;
 
@@ -12,6 +13,9 @@ public final class WorldmindFabricMod implements ModInitializer {
 
     @Override
     public void onInitialize() {
+        CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) ->
+            WorldmindCommandRegistration.register(dispatcher, serverLifecycle)
+        );
         ServerLifecycleEvents.SERVER_STARTED.register(serverLifecycle::onServerStarted);
         ServerLifecycleEvents.SERVER_STOPPING.register(serverLifecycle::onServerStopping);
         // CHAT_MESSAGE is Fabric's post-acceptance public-player-chat event.

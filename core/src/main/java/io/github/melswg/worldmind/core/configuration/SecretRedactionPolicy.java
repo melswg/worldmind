@@ -1,5 +1,7 @@
 package io.github.melswg.worldmind.core.configuration;
 
+import java.util.Comparator;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -17,7 +19,12 @@ public final class SecretRedactionPolicy {
     public static String redact(String input) {
         if (input == null) return null;
         String result = input;
-        for (String value : VALUES) result = result.replace(value, REDACTED);
+        // Stable ordering avoids partial replacement when one registered
+        // credential is a prefix of another and keeps exports reproducible.
+        List<String> values = VALUES.stream()
+            .sorted(Comparator.comparingInt(String::length).reversed().thenComparing(Comparator.naturalOrder()))
+            .toList();
+        for (String value : values) result = result.replace(value, REDACTED);
         return result;
     }
 

@@ -99,6 +99,36 @@ class FabricChatObservationRuntimeTest {
     }
 
     @Test
+    void reloadRetirementSealsPendingObservationsAndAuditsThemWithoutProviderDelivery() {
+        WorldmindAcceptanceScenario scenario = WorldmindTestkit.scenario();
+        RecordingSink sink = new RecordingSink();
+        InMemoryDialogueJournal journal = new InMemoryDialogueJournal(WORLD, scenario.clock());
+        FabricChatObservationRuntime runtime = runtime(
+            scenario,
+            sink,
+            journal,
+            configuration(new ChatBatchingConfiguration(8, 5_000, 4_000), new RequestQueueConfiguration(16, 1))
+        );
+
+        runtime.observeCapturedPublicChat(captured("The rain is holding.", AddressingSignal.NONE), WORLD);
+        scenario.serverScheduler().runUntilIdle();
+
+        join(runtime.retireForReload());
+
+        DialogueJournalSnapshot snapshot = join(journal.readSnapshot());
+        JournaledBatch retired = snapshot.batches().stream().findFirst().orElseThrow();
+        JournalBatchOutcome outcome = snapshot.outcomes().get(retired.batchId());
+        assertEquals(io.github.melswg.worldmind.core.conversation.ChatBatchSealReason.CONFIGURATION_RELOAD, retired.sealReason());
+        assertEquals(ProviderAttemptOutcome.NOT_ATTEMPTED, outcome.providerAttemptOutcome());
+        assertEquals(io.github.melswg.worldmind.core.conversation.RefusalCode.RUNTIME_RELOADED,
+            outcome.refusalCode().orElseThrow());
+        assertEquals(io.github.melswg.worldmind.core.journal.JournalDeliveryStatus.ROUTING_SKIPPED, outcome.delivery().status());
+        assertTrue(scenario.languageModel().receivedRequests().isEmpty());
+        assertTrue(sink.broadcasts.isEmpty());
+        assertTrue(sink.privateMessages.isEmpty());
+    }
+
+    @Test
     void keepsNextExactBatchBehindThePriorDeliveredBatch() {
         WorldmindAcceptanceScenario scenario = WorldmindTestkit.scenario();
         scenario.languageModel().willRespondWithSequence("DIRECT_REPLY\nfirst", "DIRECT_REPLY\nsecond");

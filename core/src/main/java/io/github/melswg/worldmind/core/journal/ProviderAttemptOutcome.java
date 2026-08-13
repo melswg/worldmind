@@ -4,5 +4,6 @@ package io.github.melswg.worldmind.core.journal;
 public enum ProviderAttemptOutcome {
     SUCCEEDED,
     FAILED,
-    NOT_ATTEMPTED
+    NOT_ATTEMPTED,
+    CANCELLED
 }

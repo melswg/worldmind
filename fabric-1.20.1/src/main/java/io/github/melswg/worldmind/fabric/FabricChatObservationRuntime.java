@@ -1,5 +1,8 @@
 package io.github.melswg.worldmind.fabric;
 
+import io.github.melswg.worldmind.core.administration.ChatBatchingStatus;
+import io.github.melswg.worldmind.core.administration.CompactionStatus;
+import io.github.melswg.worldmind.core.administration.WorkStatus;
 import io.github.melswg.worldmind.core.configuration.ValidatedWorldmindConfiguration;
 import io.github.melswg.worldmind.core.conversation.AsyncWorkKind;
 import io.github.melswg.worldmind.core.conversation.AsyncWorkRejectedException;
@@ -22,6 +25,8 @@ import io.github.melswg.worldmind.core.conversation.RetryingLanguageModel;
 import io.github.melswg.worldmind.core.conversation.JitterSource;
 import io.github.melswg.worldmind.core.conversation.CircuitBreakingLanguageModel;
 import io.github.melswg.worldmind.core.conversation.ProviderCircuitBreaker;
+import io.github.melswg.worldmind.core.conversation.ProviderCircuitSnapshot;
+import io.github.melswg.worldmind.core.conversation.RetrySnapshot;
 import io.github.melswg.worldmind.core.conversation.ServerRequester;
 import io.github.melswg.worldmind.core.conversation.SealedChatBatch;
 import io.github.melswg.worldmind.core.conversation.UntrustedContext;
@@ -38,6 +43,7 @@ import io.github.melswg.worldmind.core.memory.MemoryCompactionRepository;
 import io.github.melswg.worldmind.core.memory.MemoryCompactionService;
 import java.time.Clock;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -45,6 +51,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 import net.minecraft.network.message.SignedMessage;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
@@ -59,6 +67,7 @@ final class FabricChatObservationRuntime implements AutoCloseable {
     private final WorldIdentity ownedWorld;
     private final ValidatedWorldmindConfiguration configuration;
     private final AtomicBoolean active = new AtomicBoolean(true);
+    private final AtomicBoolean retiring = new AtomicBoolean();
     private final AutoCloseable delayedSchedulerCloser;
     private final AutoCloseable serverSchedulerCloser;
     private final DialogueJournal journal;
@@ -72,6 +81,10 @@ final class FabricChatObservationRuntime implements AutoCloseable {
     private final FabricChatOutcomeRouter outcomeRouter;
     private final ChatBatchCoordinator batchCoordinator;
     private final Set<CompletableFuture<Void>> pendingAuditWrites = ConcurrentHashMap.newKeySet();
+    private final Supplier<ProviderCircuitSnapshot> circuitSnapshot;
+    private final Supplier<RetrySnapshot> retrySnapshot;
+    private final AtomicInteger compactionOutstanding = new AtomicInteger();
+    private volatile String lastCompactionOutcome = "NONE";
 
     static FabricChatObservationRuntime createProduction(
         MinecraftServer server,
@@ -85,6 +98,16 @@ final class FabricChatObservationRuntime implements AutoCloseable {
         FabricDelayedScheduler delayedScheduler = new FabricDelayedScheduler();
         try {
             FabricServerScheduler serverScheduler = new FabricServerScheduler(server);
+            RetryingLanguageModel retrying = new RetryingLanguageModel(
+                languageModel,
+                configuration.globalConfiguration().provider().retry(),
+                delayedScheduler,
+                JitterSource.random()
+            );
+            ProviderCircuitBreaker breaker = new ProviderCircuitBreaker(
+                configuration.globalConfiguration().provider().circuitBreaker(),
+                Clock.systemUTC()
+            );
             return new FabricChatObservationRuntime(
                 ownedWorld,
                 journal,
@@ -96,17 +119,9 @@ final class FabricChatObservationRuntime implements AutoCloseable {
                 serverScheduler,
                 new ConversationApplicationService(
                     new CircuitBreakingLanguageModel(
-                        new RetryingLanguageModel(
-                            languageModel,
-                            configuration.globalConfiguration().provider().retry(),
-                            delayedScheduler,
-                            JitterSource.random()
-                        ),
+                        retrying,
                         languageModel,
-                        new ProviderCircuitBreaker(
-                            configuration.globalConfiguration().provider().circuitBreaker(),
-                            Clock.systemUTC()
-                        )
+                        breaker
                     ),
                     serverScheduler,
                     journal instanceof WorldMemoryRepository memoryRepository
@@ -115,7 +130,9 @@ final class FabricChatObservationRuntime implements AutoCloseable {
                 ),
                 providerCapabilities,
                 new FabricServerChatSink(server),
-                diagnostics
+                diagnostics,
+                breaker::snapshot,
+                retrying::snapshot
             );
         } catch (RuntimeException failure) {
             delayedScheduler.close();
@@ -137,6 +154,29 @@ final class FabricChatObservationRuntime implements AutoCloseable {
         ServerChatSink chatSink,
         FabricChatDiagnostics diagnostics
     ) {
+        this(
+            ownedWorld, journal, configuration, clock, delayedScheduler, delayedSchedulerCloser, serverSchedulerCloser,
+            serverScheduler, applicationService, providerCapabilities, chatSink, diagnostics,
+            () -> null, () -> new RetrySnapshot(0, 0)
+        );
+    }
+
+    FabricChatObservationRuntime(
+        WorldIdentity ownedWorld,
+        DialogueJournal journal,
+        ValidatedWorldmindConfiguration configuration,
+        Clock clock,
+        DelayedScheduler delayedScheduler,
+        AutoCloseable delayedSchedulerCloser,
+        AutoCloseable serverSchedulerCloser,
+        Executor serverScheduler,
+        ConversationApplicationService applicationService,
+        ProviderCapabilities providerCapabilities,
+        ServerChatSink chatSink,
+        FabricChatDiagnostics diagnostics,
+        Supplier<ProviderCircuitSnapshot> circuitSnapshot,
+        Supplier<RetrySnapshot> retrySnapshot
+    ) {
         this.ownedWorld = Objects.requireNonNull(ownedWorld, "ownedWorld");
         this.journal = Objects.requireNonNull(journal, "journal");
         ValidatedWorldmindConfiguration validated = Objects.requireNonNull(configuration, "configuration");
@@ -147,6 +187,8 @@ final class FabricChatObservationRuntime implements AutoCloseable {
         this.clock = Objects.requireNonNull(clock, "clock");
         this.applicationService = Objects.requireNonNull(applicationService, "applicationService");
         this.diagnostics = Objects.requireNonNull(diagnostics, "diagnostics");
+        this.circuitSnapshot = Objects.requireNonNull(circuitSnapshot, "circuitSnapshot");
+        this.retrySnapshot = Objects.requireNonNull(retrySnapshot, "retrySnapshot");
         this.compactionService = journal instanceof MemoryCompactionRepository repository
             ? new MemoryCompactionService(repository, new DeterministicMemoryCompactionGenerator())
             : null;
@@ -225,14 +267,57 @@ final class FabricChatObservationRuntime implements AutoCloseable {
 
     @Override
     public void close() {
+        close(true);
+    }
+
+    /** Retires one configuration generation while preserving the world journal for the successor. */
+    CompletionStage<Void> retireForReload() {
+        retiring.set(true);
+        return close(false);
+    }
+
+    private CompletionStage<Void> close(boolean closeJournal) {
         if (!active.compareAndSet(true, false)) {
-            return;
+            return CompletableFuture.completedFuture(null);
+        }
+        List<CompletionStage<Void>> retirementAudits = new ArrayList<>();
+        for (SealedChatBatch batch : batchCoordinator.retirePending()) {
+            retirementAudits.add(recordRetiredPendingBatch(batch));
         }
         batchCoordinator.close();
         CompletionStage<Void> workStopped = workCoordinator.closeAsync();
         closeQuietly(delayedSchedulerCloser);
         closeQuietly(serverSchedulerCloser);
-        workStopped.thenCompose(ignored -> awaitAuditWrites()).whenComplete((ignored, failure) -> journal.closeAsync());
+        CompletionStage<Void> finished = workStopped
+            .thenCompose(ignored -> allOf(retirementAudits))
+            .thenCompose(ignored -> awaitAuditWrites());
+        if (closeJournal) {
+            finished.whenComplete((ignored, failure) -> journal.closeAsync());
+        }
+        return finished;
+    }
+
+    ChatBatchingStatus batchingStatus() {
+        var batching = batchCoordinator.snapshot();
+        var limits = configuration.globalConfiguration().chatBatching();
+        return new ChatBatchingStatus(
+            limits.maxMessages(), limits.maxWaitMillis(), limits.maxEstimatedInputCharacters(),
+            batching.pendingMessages(), batching.pendingBatches()
+        );
+    }
+
+    WorkStatus workStatus() {
+        var work = workCoordinator.snapshot();
+        RetrySnapshot retry = retrySnapshot.get();
+        return new WorkStatus(work.queued(), work.inFlight(), work.closed(), retry.activeAttempts(), retry.waitingBackoff());
+    }
+
+    ProviderCircuitSnapshot circuitStatus() {
+        return circuitSnapshot.get();
+    }
+
+    CompactionStatus compactionStatus() {
+        return new CompactionStatus(0, compactionOutstanding.get(), lastCompactionOutcome);
     }
 
     private CompletionStage<?> decideAndDeliver(io.github.melswg.worldmind.core.conversation.SealedChatBatch batch) {
@@ -314,8 +399,11 @@ final class FabricChatObservationRuntime implements AutoCloseable {
                 completed.complete(null);
                 return;
             }
-            JournalDeliveryReport delivery = outcomeRouter.deliver(batch, resolved);
-            JournalBatchOutcome audit = journalOutcome(journaledBatch, resolved, delivery);
+            ConversationOutcome terminal = retiring.get()
+                ? new ConversationRefusal(RefusalCode.RUNTIME_RELOADED)
+                : resolved;
+            JournalDeliveryReport delivery = outcomeRouter.deliver(batch, terminal);
+            JournalBatchOutcome audit = journalOutcome(journaledBatch, terminal, delivery);
             appendTrackedOutcome(audit).whenComplete((ignored, journalFailure) -> {
                 if (journalFailure == null) startCompaction(journaledBatch);
                 completed.complete(null);
@@ -332,10 +420,11 @@ final class FabricChatObservationRuntime implements AutoCloseable {
     ) {
         CompletableFuture<Void> completed = new CompletableFuture<>();
         Runnable deliverAndPersist = () -> {
-            JournalDeliveryReport delivery = outcomeRouter.deliver(batch, new ConversationRefusal(RefusalCode.REQUEST_QUEUE_UNAVAILABLE));
+            RefusalCode code = terminalRefusal();
+            JournalDeliveryReport delivery = outcomeRouter.deliver(batch, new ConversationRefusal(code));
             JournalBatchOutcome audit = new JournalBatchOutcome(
                 journaledBatch.batchId(), ProviderAttemptOutcome.NOT_ATTEMPTED, java.util.Optional.empty(),
-                java.util.Optional.of(RefusalCode.REQUEST_QUEUE_UNAVAILABLE), delivery, clock.instant()
+                java.util.Optional.of(code), delivery, clock.instant()
             );
             appendTrackedOutcome(audit).whenComplete((ignored, failure) -> completed.complete(null));
         };
@@ -355,12 +444,14 @@ final class FabricChatObservationRuntime implements AutoCloseable {
         JournaledBatch journaledBatch,
         ConversationWorkState workState
     ) {
-        JournalDeliveryReport delivery = outcomeRouter.deliver(batch, new ConversationRefusal(RefusalCode.REQUEST_QUEUE_UNAVAILABLE));
+        RefusalCode code = terminalRefusal();
+        JournalDeliveryReport delivery = outcomeRouter.deliver(batch, new ConversationRefusal(code));
         JournalBatchOutcome audit = new JournalBatchOutcome(
             journaledBatch.batchId(),
-            workState.providerAttempted.get() ? ProviderAttemptOutcome.FAILED : ProviderAttemptOutcome.NOT_ATTEMPTED,
+            retiring.get() ? ProviderAttemptOutcome.CANCELLED
+                : workState.providerAttempted.get() ? ProviderAttemptOutcome.FAILED : ProviderAttemptOutcome.NOT_ATTEMPTED,
             java.util.Optional.empty(),
-            java.util.Optional.of(RefusalCode.REQUEST_QUEUE_UNAVAILABLE),
+            java.util.Optional.of(code),
             delivery,
             clock.instant()
         );
@@ -403,7 +494,10 @@ final class FabricChatObservationRuntime implements AutoCloseable {
             ownedWorld, journaledBatch.lastSequence(), AsyncWorkKind.COMPACTION, () -> compactionService.compactNext(ownedWorld)
         );
         if (!submission.accepted()) return;
+        compactionOutstanding.incrementAndGet();
         submission.completion().whenComplete((ignored, failure) -> {
+            compactionOutstanding.decrementAndGet();
+            lastCompactionOutcome = failure == null ? "SUCCESS" : "FAILED";
             if (failure != null && active.get()) {
                 diagnostics.record(FabricChatDeliveryDiagnostic.delivery(
                     FabricChatDeliveryDiagnosticKind.COMPACTION_FAILED, journaledBatch.firstSequence(), journaledBatch.lastSequence()
@@ -432,6 +526,7 @@ final class FabricChatObservationRuntime implements AutoCloseable {
         ConversationRefusal refusal = (ConversationRefusal) outcome;
         ProviderAttemptOutcome providerResult = switch (refusal.code()) {
             case PROVIDER_INCOMPATIBLE, PROMPT_BUDGET_EXCEEDED, MEMORY_UNAVAILABLE, REQUEST_QUEUE_UNAVAILABLE -> ProviderAttemptOutcome.NOT_ATTEMPTED;
+            case RUNTIME_RELOADED -> ProviderAttemptOutcome.CANCELLED;
             default -> ProviderAttemptOutcome.FAILED;
         };
         return new JournalBatchOutcome(batch.batchId(), providerResult,
@@ -455,6 +550,36 @@ final class FabricChatObservationRuntime implements AutoCloseable {
         } catch (Exception ignored) {
             // Closing one local resource must not retain server state or stop Minecraft.
         }
+    }
+
+    private RefusalCode terminalRefusal() {
+        return retiring.get() ? RefusalCode.RUNTIME_RELOADED : RefusalCode.REQUEST_QUEUE_UNAVAILABLE;
+    }
+
+    private CompletionStage<Void> recordRetiredPendingBatch(SealedChatBatch batch) {
+        CompletableFuture<Void> completed = new CompletableFuture<>();
+        journal.appendBatch(batch).whenComplete((journaled, failure) -> {
+            if (journaled == null || failure != null) {
+                completed.complete(null);
+                return;
+            }
+            JournalBatchOutcome audit = new JournalBatchOutcome(
+                journaled.batchId(), ProviderAttemptOutcome.NOT_ATTEMPTED, java.util.Optional.empty(),
+                java.util.Optional.of(RefusalCode.RUNTIME_RELOADED),
+                new JournalDeliveryReport(io.github.melswg.worldmind.core.journal.JournalDeliveryStatus.ROUTING_SKIPPED,
+                    java.util.Optional.empty()),
+                clock.instant()
+            );
+            appendTrackedOutcome(audit).whenComplete((ignored, auditFailure) -> completed.complete(null));
+        });
+        return completed;
+    }
+
+    private static CompletionStage<Void> allOf(List<CompletionStage<Void>> stages) {
+        if (stages.isEmpty()) return CompletableFuture.completedFuture(null);
+        CompletableFuture<?>[] futures = stages.stream().map(CompletionStage::toCompletableFuture)
+            .toArray(CompletableFuture[]::new);
+        return CompletableFuture.allOf(futures);
     }
 
     private static final class ConversationWorkState {

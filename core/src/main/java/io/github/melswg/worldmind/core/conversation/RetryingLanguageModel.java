@@ -5,6 +5,7 @@ import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** Keeps retry/backoff inside one cancellable language-model invocation. */
 public final class RetryingLanguageModel implements LanguageModel {
@@ -12,6 +13,8 @@ public final class RetryingLanguageModel implements LanguageModel {
     private final ProviderRetryConfiguration policy;
     private final DelayedScheduler scheduler;
     private final JitterSource jitter;
+    private final AtomicInteger activeAttempts = new AtomicInteger();
+    private final AtomicInteger waitingBackoff = new AtomicInteger();
 
     public RetryingLanguageModel(
         LanguageModel delegate,
@@ -23,6 +26,11 @@ public final class RetryingLanguageModel implements LanguageModel {
         this.policy = Objects.requireNonNull(policy, "policy");
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
         this.jitter = Objects.requireNonNull(jitter, "jitter");
+    }
+
+    /** Safe live accounting for the runtime status surface. */
+    public RetrySnapshot snapshot() {
+        return new RetrySnapshot(activeAttempts.get(), waitingBackoff.get());
     }
 
     @Override
@@ -38,6 +46,7 @@ public final class RetryingLanguageModel implements LanguageModel {
         private final CompletableFuture<LanguageModelResult> result = new CompletableFuture<>();
         private volatile CompletionStage<?> active;
         private volatile ScheduledWork pendingBackoff;
+        private volatile boolean backoffCounted;
 
         private RequestLifecycle(ProviderRequest request) {
             this.request = request;
@@ -46,16 +55,19 @@ public final class RetryingLanguageModel implements LanguageModel {
 
         private void attempt(int number) {
             if (result.isDone()) return;
+            activeAttempts.incrementAndGet();
             CompletionStage<LanguageModelResult> stage;
             try {
                 stage = delegate.complete(request);
                 if (stage == null) throw new IllegalStateException("Language model returned no completion stage.");
             } catch (RuntimeException failure) {
+                activeAttempts.decrementAndGet();
                 result.complete(new ProviderFailure(ProviderFailureKind.CONNECTION_FAILURE));
                 return;
             }
             active = stage;
             stage.whenComplete((value, failure) -> {
+                activeAttempts.decrementAndGet();
                 if (result.isDone()) return;
                 LanguageModelResult resolved = failure == null && value != null
                     ? value : new ProviderFailure(ProviderFailureKind.CONNECTION_FAILURE);
@@ -69,7 +81,12 @@ public final class RetryingLanguageModel implements LanguageModel {
 
         private void scheduleRetry(int nextAttempt, int failedAttempt) {
             long delay = delayFor(failedAttempt);
-            pendingBackoff = scheduler.schedule(Duration.ofMillis(delay), () -> attempt(nextAttempt));
+            waitingBackoff.incrementAndGet();
+            backoffCounted = true;
+            pendingBackoff = scheduler.schedule(Duration.ofMillis(delay), () -> {
+                consumeBackoffCount();
+                attempt(nextAttempt);
+            });
         }
 
         private long delayFor(int failedAttempt) {
@@ -92,9 +109,17 @@ public final class RetryingLanguageModel implements LanguageModel {
         private void cancelOwned() {
             ScheduledWork delayed = pendingBackoff;
             if (delayed != null) delayed.cancel();
+            consumeBackoffCount();
             CompletionStage<?> stage = active;
             if (stage != null) {
                 try { stage.toCompletableFuture().cancel(true); } catch (RuntimeException ignored) { }
+            }
+        }
+
+        private void consumeBackoffCount() {
+            if (backoffCounted) {
+                backoffCounted = false;
+                waitingBackoff.decrementAndGet();
             }
         }
     }

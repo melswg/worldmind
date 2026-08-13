@@ -2,6 +2,7 @@ package io.github.melswg.worldmind.fabric.provider;
 
 import io.github.melswg.worldmind.core.configuration.ExternalSecretReference;
 import io.github.melswg.worldmind.core.configuration.SecretAvailability;
+import io.github.melswg.worldmind.core.configuration.SecretRedactionPolicy;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Function;
@@ -30,6 +31,9 @@ public final class EnvironmentProviderCredentialResolver implements ProviderCred
         }
         try {
             String material = environment.apply(matcher.group(1));
+            if (material != null && !material.isBlank()) {
+                SecretRedactionPolicy.register(material);
+            }
             return material == null || material.isBlank() ? SecretAvailability.MISSING : SecretAvailability.AVAILABLE;
         } catch (RuntimeException failure) {
             return SecretAvailability.UNREADABLE;
@@ -44,6 +48,9 @@ public final class EnvironmentProviderCredentialResolver implements ProviderCred
         }
         try {
             String material = environment.apply(matcher.group(1));
+            if (material != null && !material.isBlank()) {
+                SecretRedactionPolicy.register(material);
+            }
             return material == null || material.isBlank() ? Optional.empty() : Optional.of(new ProviderCredential(material));
         } catch (RuntimeException failure) {
             return Optional.empty();

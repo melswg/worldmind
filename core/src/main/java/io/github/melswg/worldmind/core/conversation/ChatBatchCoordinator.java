@@ -115,6 +115,50 @@ public final class ChatBatchCoordinator implements AutoCloseable {
         worlds.clear();
     }
 
+    /** Returns accounting only; no raw message, player, or context data is exposed. */
+    public synchronized ChatBatchSnapshot snapshot() {
+        int messages = 0;
+        int batches = 0;
+        for (WorldState state : worlds.values()) {
+            if (state.pending != null) {
+                batches++;
+                messages += state.pending.messages.size();
+            }
+            if (state.nextPending != null) {
+                batches++;
+                messages += state.nextPending.messages.size();
+            }
+            if (state.sealedNext != null) {
+                batches++;
+            }
+        }
+        return new ChatBatchSnapshot(messages, batches, closed);
+    }
+
+    /**
+     * Seals not-yet-handed-off work for a configuration retirement. The
+     * currently handed-off batch remains owned by its caller, which can
+     * terminally audit it after cancelling its asynchronous work.
+     */
+    public synchronized List<SealedChatBatch> retirePending() {
+        if (closed) return List.of();
+        List<SealedChatBatch> retired = new ArrayList<>();
+        for (Map.Entry<WorldIdentity, WorldState> entry : worlds.entrySet()) {
+            WorldState state = entry.getValue();
+            if (state.pending != null) {
+                retired.add(seal(entry.getKey(), state, state.pending, ChatBatchSealReason.CONFIGURATION_RELOAD));
+            }
+            if (state.nextPending != null) {
+                retired.add(seal(entry.getKey(), state, state.nextPending, ChatBatchSealReason.CONFIGURATION_RELOAD));
+            }
+            if (state.sealedNext != null) {
+                retired.add(state.sealedNext);
+                state.sealedNext = null;
+            }
+        }
+        return List.copyOf(retired);
+    }
+
     private void scheduleDeadline(WorldIdentity worldIdentity, WorldState state, PendingBatch pending) {
         Object deadlineIdentity = new Object();
         pending.deadlineIdentity = deadlineIdentity;

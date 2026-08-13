@@ -1,11 +1,13 @@
 package io.github.melswg.worldmind.fabric;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 
 import io.github.melswg.worldmind.core.AuthoritativeInitializationPath;
 import io.github.melswg.worldmind.core.AuthoritativeWorldmindInitializer;
 import io.github.melswg.worldmind.core.WorldmindAuthoritativeRuntime;
+import io.github.melswg.worldmind.core.administration.AdministrationResultCode;
 import io.github.melswg.worldmind.core.configuration.DisabledWorldmindIntegration;
 import io.github.melswg.worldmind.core.configuration.IntegrationDisableReason;
 import io.github.melswg.worldmind.core.configuration.SecretAvailability;
@@ -71,6 +73,23 @@ class WorldmindFabricServerLifecycleTest {
             configurationDirectory.resolve("worldmind").resolve("worldmind.sqlite3"),
             WorldmindFabricServerLifecycle.journalDatabasePath(configurationDirectory)
         );
+    }
+
+    @Test
+    void administrationStatusAndValidationUseTheSameServerOnlyLifecycleWithoutProviderRequests() throws IOException {
+        writeValidConfiguration();
+        FakeSecretResolver secrets = WorldmindTestkit.secretResolver().willResolveAs(SecretAvailability.MISSING);
+        WorldmindFabricServerLifecycle lifecycle = new WorldmindFabricServerLifecycle(
+            new AuthoritativeWorldmindInitializer(),
+            new WorldmindStartupConfigurationLoader(configurationDirectory, secrets)
+        );
+
+        lifecycle.onServerStarted(null);
+
+        assertFalse(lifecycle.status().integrationEnabled());
+        assertEquals(AdministrationResultCode.VALIDATION_FAILED, lifecycle.validate().toCompletableFuture().join().code());
+        assertEquals(AdministrationResultCode.LIFECYCLE_NOT_READY, lifecycle.reload().toCompletableFuture().join().code());
+        assertEquals(2, secrets.resolutionCount(), "validation rechecks availability but never creates a provider request");
     }
 
     private void writeValidConfiguration() throws IOException {

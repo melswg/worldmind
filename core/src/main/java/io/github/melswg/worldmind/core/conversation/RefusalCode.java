@@ -17,5 +17,7 @@ public enum RefusalCode {
     OVERSIZED_PROVIDER_CONTENT,
     JOURNAL_UNAVAILABLE,
     MEMORY_UNAVAILABLE,
-    REQUEST_QUEUE_UNAVAILABLE
+    REQUEST_QUEUE_UNAVAILABLE,
+    /** A fully validated runtime generation replaced this work before delivery. */
+    RUNTIME_RELOADED
 }
