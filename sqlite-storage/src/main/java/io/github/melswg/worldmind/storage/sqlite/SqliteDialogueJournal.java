@@ -31,6 +31,12 @@ import io.github.melswg.worldmind.core.administration.MemoryExportPage;
 import io.github.melswg.worldmind.core.administration.MemoryExportQuery;
 import io.github.melswg.worldmind.core.administration.MemoryExportRecord;
 import io.github.melswg.worldmind.core.administration.MemoryExportRepository;
+import io.github.melswg.worldmind.core.administration.MemoryDeletionKind;
+import io.github.melswg.worldmind.core.administration.MemoryDeletionPreview;
+import io.github.melswg.worldmind.core.administration.MemoryDeletionRepository;
+import io.github.melswg.worldmind.core.administration.MemoryDeletionRequest;
+import io.github.melswg.worldmind.core.administration.MemoryDeletionResult;
+import io.github.melswg.worldmind.core.administration.AdministrationResultCode;
 import io.github.melswg.worldmind.core.memory.JournalSequenceRange;
 import io.github.melswg.worldmind.core.memory.CompactionSource;
 import io.github.melswg.worldmind.core.memory.CurrentSituationVersion;
@@ -79,6 +85,9 @@ import java.sql.Statement;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -103,7 +112,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * back into prompts, compaction, search, inspection or export.</p>
  */
 public final class SqliteDialogueJournal implements DialogueJournal, WorldMemoryRepository, MemoryCompactionRepository,
-    MemoryInspectionRepository, MemoryExportRepository {
+    MemoryInspectionRepository, MemoryExportRepository, MemoryDeletionRepository {
     public static final String DATABASE_FILE_NAME = "worldmind.sqlite3";
     public static final int SCHEMA_VERSION = 2;
     public static final int OLDEST_SUPPORTED_SCHEMA_VERSION = 1;
@@ -293,6 +302,43 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
     public CompletionStage<MemoryExportPage> exportPage(MemoryExportQuery query) {
         Objects.requireNonNull(query, "query");
         return submit(() -> readExportPage(query));
+    }
+
+    @Override
+    public CompletionStage<MemoryDeletionPreview> prepareDeletion(MemoryDeletionRequest request) {
+        Objects.requireNonNull(request, "request");
+        return submit(() -> {
+            DeletionClosure closure = resolveDeletionClosure(request);
+            return closure.affectedRecords == 0
+                ? MemoryDeletionPreview.of(AdministrationResultCode.TARGET_NOT_FOUND)
+                : new MemoryDeletionPreview(AdministrationResultCode.SUCCESS, Optional.empty(), closure.affectedRecords,
+                    Optional.empty(), Optional.of(closure.fingerprint));
+        });
+    }
+
+    @Override
+    public CompletionStage<MemoryDeletionResult> executeDeletion(MemoryDeletionRequest request, String expectedFingerprint) {
+        Objects.requireNonNull(request, "request");
+        Objects.requireNonNull(expectedFingerprint, "expectedFingerprint");
+        return submit(() -> {
+            MemoryDeletionResult result = withTransaction(() -> {
+                DeletionClosure closure = resolveDeletionClosure(request);
+                if (closure.affectedRecords == 0) return MemoryDeletionResult.of(AdministrationResultCode.TARGET_NOT_FOUND, request.kind());
+                if (!MessageDigest.isEqual(expectedFingerprint.getBytes(StandardCharsets.US_ASCII), closure.fingerprint.getBytes(StandardCharsets.US_ASCII))) {
+                    return MemoryDeletionResult.of(AdministrationResultCode.TARGET_CHANGED, request.kind());
+                }
+                int affected = switch (request.kind()) {
+                    case DELETE_RECORD -> deleteRecord(request, closure);
+                    case DELETE_PLAYER -> deletePlayer(request, closure);
+                    case RESET_WORLD -> resetWorld();
+                };
+                rebuildSearchDocuments(connection);
+                incrementContentRevision();
+                return new MemoryDeletionResult(AdministrationResultCode.SUCCESS, request.kind(), affected, true);
+            });
+            if (result.code() == AdministrationResultCode.SUCCESS) checkpointAfterDeletion(request.kind());
+            return result;
+        });
     }
 
     @Override
@@ -748,6 +794,250 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
         statement.setString(parameter++, cursor.stableIdentity());
         return parameter;
     }
+
+    private DeletionClosure resolveDeletionClosure(MemoryDeletionRequest request) throws SQLException {
+        java.util.LinkedHashSet<Long> observations = new java.util.LinkedHashSet<>();
+        java.util.LinkedHashSet<String> batches = new java.util.LinkedHashSet<>();
+        java.util.ArrayList<String> fingerprintParts = new java.util.ArrayList<>();
+        int direct = 0;
+        switch (request.kind()) {
+            case DELETE_RECORD -> {
+                String identity = request.stableIdentity().orElseThrow();
+                MemoryRecordType type = request.recordType().orElseThrow();
+                switch (type) {
+                    case OBSERVATION -> {
+                        Long sequence = parseSequenceIdentity(identity, "observation:");
+                        if (sequence != null && exists("SELECT 1 FROM journal_observations WHERE sequence = ? AND raw_state <> 'DELETED'", sequence)) {
+                            observations.add(sequence); direct++;
+                        }
+                    }
+                    case BATCH -> { if (exists("SELECT 1 FROM journal_batches WHERE batch_id = ?", identity.substring("batch:".length()))) { batches.add(identity.substring("batch:".length())); direct++; } }
+                    case OUTCOME -> { if (exists("SELECT 1 FROM journal_outcomes WHERE batch_id = ?", identity.substring("outcome:".length()))) { batches.add(identity.substring("outcome:".length())); direct++; } }
+                    case REPLY -> { if (exists("SELECT 1 FROM journal_outcomes WHERE batch_id = ? AND delivered_response IS NOT NULL", identity.substring("reply:".length()))) { batches.add(identity.substring("reply:".length())); direct++; } }
+                    case FACT -> { if (exists("SELECT 1 FROM memory_records WHERE record_id = ? AND record_type = 'FACT'", identity.substring("fact:".length()))) direct++; }
+                    case RELATIONSHIP -> { if (exists("SELECT 1 FROM memory_records WHERE record_id = ? AND record_type = 'RELATIONSHIP'", identity.substring("relationship:".length()))) direct++; }
+                    case EVENT -> { if (exists("SELECT 1 FROM memory_events WHERE event_id = ?", identity.substring("event:".length()))) direct++; }
+                    case SUMMARY -> { if (exists("SELECT 1 FROM memory_summary_versions WHERE summary_version_id = ?", identity.substring("summary:".length()))) direct++; }
+                    case CURRENT_SITUATION -> { if (exists("SELECT 1 FROM memory_current_situation_versions WHERE situation_version_id = ?", identity.substring("situation:".length()))) direct++; }
+                }
+            }
+            case DELETE_PLAYER -> {
+                String player = request.scope().playerId().orElseThrow().toString();
+                try (PreparedStatement rows = connection.prepareStatement("SELECT sequence FROM journal_observations WHERE player_uuid = ? ORDER BY sequence")) {
+                    rows.setString(1, player);
+                    try (ResultSet result = rows.executeQuery()) { while (result.next()) observations.add(result.getLong(1)); }
+                }
+                direct += observations.size();
+                direct += count("SELECT count(*) FROM memory_records WHERE scope_type = 'PLAYER' AND scope_player_uuid = ? OR record_type = 'RELATIONSHIP' AND relationship_subject_uuid = ?", player, player);
+                direct += count("SELECT count(*) FROM memory_events WHERE scope_type = 'PLAYER' AND scope_player_uuid = ?", player);
+                direct += count("SELECT count(*) FROM memory_summary_versions WHERE scope_type = 'PLAYER' AND scope_player_uuid = ?", player);
+                direct += count("SELECT count(*) FROM memory_current_situation_versions WHERE scope_type = 'PLAYER' AND scope_player_uuid = ?", player);
+            }
+            case RESET_WORLD -> direct = count("SELECT (SELECT count(*) FROM journal_observations) + (SELECT count(*) FROM journal_batches) + (SELECT count(*) FROM journal_outcomes) + (SELECT count(*) FROM memory_records) + (SELECT count(*) FROM memory_events) + (SELECT count(*) FROM memory_summary_versions) + (SELECT count(*) FROM memory_current_situation_versions)");
+        }
+        for (Long observation : observations) {
+            fingerprintParts.add("o:" + observation);
+            try (PreparedStatement rows = connection.prepareStatement("SELECT batch_id FROM journal_batch_messages WHERE message_sequence = ? ORDER BY batch_id")) {
+                rows.setLong(1, observation);
+                try (ResultSet result = rows.executeQuery()) { while (result.next()) batches.add(result.getString(1)); }
+            }
+        }
+        for (String batch : batches) fingerprintParts.add("b:" + batch);
+        java.util.Collections.sort(fingerprintParts);
+        int derived = derivedClosureCount(batches, fingerprintParts);
+        int affected = direct + derived;
+        if (request.kind() == MemoryDeletionKind.RESET_WORLD) fingerprintParts.add("r:" + metadata(connection, "content_revision"));
+        fingerprintParts.add("target:" + request.kind() + ":" + request.scope().fingerprint() + ":" + request.stableIdentity().orElse(""));
+        return new DeletionClosure(observations, batches, affected, fingerprint(fingerprintParts));
+    }
+
+    private int derivedClosureCount(java.util.Set<String> batches, List<String> fingerprintParts) throws SQLException {
+        if (batches.isEmpty()) return 0;
+        int count = 0;
+        String sql = "SELECT record_kind, record_id, batch_id FROM memory_derived_sources WHERE batch_id IN (" + placeholders(batches.size()) + ") ORDER BY record_kind, record_id, batch_id";
+        try (PreparedStatement rows = connection.prepareStatement(sql)) {
+            bindStrings(rows, 1, batches);
+            try (ResultSet result = rows.executeQuery()) {
+                while (result.next()) { fingerprintParts.add("d:" + result.getString(1) + ":" + result.getString(2) + ":" + result.getString(3)); count++; }
+            }
+        }
+        return count;
+    }
+
+    private int deleteRecord(MemoryDeletionRequest request, DeletionClosure closure) throws SQLException {
+        MemoryRecordType type = request.recordType().orElseThrow();
+        String identity = request.stableIdentity().orElseThrow();
+        return switch (type) {
+            case OBSERVATION -> {
+                long sequence = closure.observations.iterator().next();
+                int count = deletePayloads(closure.observations) + markObservationsUnavailable(closure.observations, "DELETED");
+                yield count + invalidateBatches(closure.batches);
+            }
+            case BATCH -> invalidateBatches(closure.batches);
+            case OUTCOME -> updateOutcome(identity.substring("outcome:".length()), false);
+            case REPLY -> updateOutcome(identity.substring("reply:".length()), true);
+            case FACT, RELATIONSHIP -> deleteMemoryRecord(identity.substring(type == MemoryRecordType.FACT ? "fact:".length() : "relationship:".length()));
+            case EVENT -> deleteDerived("EVENT", identity.substring("event:".length()));
+            case SUMMARY -> deleteDerived("SUMMARY", identity.substring("summary:".length()));
+            case CURRENT_SITUATION -> deleteDerived("CURRENT_SITUATION", identity.substring("situation:".length()));
+        };
+    }
+
+    private int deletePlayer(MemoryDeletionRequest request, DeletionClosure closure) throws SQLException {
+        String player = request.scope().playerId().orElseThrow().toString();
+        int affected = deletePayloads(closure.observations) + markObservationsUnavailable(closure.observations, "DELETED");
+        affected += invalidateBatches(closure.batches);
+        affected += delete("DELETE FROM memory_confirmations WHERE record_id IN (SELECT record_id FROM memory_records WHERE scope_type = 'PLAYER' AND scope_player_uuid = ? OR record_type = 'RELATIONSHIP' AND relationship_subject_uuid = ?)", player, player);
+        affected += delete("DELETE FROM memory_records WHERE scope_type = 'PLAYER' AND scope_player_uuid = ? OR record_type = 'RELATIONSHIP' AND relationship_subject_uuid = ?", player, player);
+        affected += delete("DELETE FROM memory_events WHERE scope_type = 'PLAYER' AND scope_player_uuid = ?", player);
+        affected += delete("DELETE FROM memory_summary_versions WHERE scope_type = 'PLAYER' AND scope_player_uuid = ?", player);
+        affected += delete("DELETE FROM memory_current_situation_versions WHERE scope_type = 'PLAYER' AND scope_player_uuid = ?", player);
+        return affected;
+    }
+
+    private int resetWorld() throws SQLException {
+        int affected = 0;
+        affected += delete("DELETE FROM memory_confirmations");
+        affected += delete("DELETE FROM memory_derived_sources");
+        affected += delete("DELETE FROM memory_compaction_batch_coverage");
+        affected += delete("DELETE FROM memory_compaction_coverage");
+        affected += delete("DELETE FROM memory_records");
+        affected += delete("DELETE FROM memory_events");
+        affected += delete("DELETE FROM memory_summary_versions");
+        affected += delete("DELETE FROM memory_current_situation_versions");
+        affected += delete("DELETE FROM journal_outcomes");
+        affected += delete("DELETE FROM journal_batch_messages");
+        affected += delete("DELETE FROM journal_observation_payloads");
+        affected += delete("DELETE FROM journal_batches");
+        affected += delete("DELETE FROM journal_observations");
+        return affected;
+    }
+
+    private int invalidateBatches(java.util.Set<String> batchIds) throws SQLException {
+        if (batchIds.isEmpty()) return 0;
+        int affected = updateIn("UPDATE journal_batches SET source_state = 'INVALIDATED' WHERE batch_id IN (", batchIds);
+        affected += updateIn("UPDATE journal_outcomes SET outcome_state = 'INVALIDATED', reply_state = 'DELETED', delivered_response = NULL WHERE batch_id IN (", batchIds);
+        affected += deleteDerivedForBatches(batchIds);
+        try (PreparedStatement coverage = connection.prepareStatement("INSERT OR REPLACE INTO memory_compaction_batch_coverage(batch_id, coverage_state, recorded_at_epoch_millis) VALUES (?, 'SKIPPED_INVALIDATED', ?)")) {
+            for (String batch : batchIds) { coverage.setString(1, batch); coverage.setLong(2, Instant.now().toEpochMilli()); coverage.addBatch(); }
+            coverage.executeBatch();
+        }
+        return affected;
+    }
+
+    private int deleteDerivedForBatches(java.util.Set<String> batchIds) throws SQLException {
+        if (batchIds.isEmpty()) return 0;
+        int affected = deleteIn("DELETE FROM memory_confirmations WHERE record_id IN (SELECT record_id FROM memory_records WHERE source_batch_id IN (", batchIds, "))");
+        affected += deleteIn("DELETE FROM memory_records WHERE source_batch_id IN (", batchIds, ")");
+        java.util.Map<String, java.util.LinkedHashSet<String>> ids = new java.util.LinkedHashMap<>();
+        String sql = "SELECT DISTINCT record_kind, record_id FROM memory_derived_sources WHERE batch_id IN (" + placeholders(batchIds.size()) + ")";
+        try (PreparedStatement rows = connection.prepareStatement(sql)) {
+            bindStrings(rows, 1, batchIds);
+            try (ResultSet result = rows.executeQuery()) { while (result.next()) ids.computeIfAbsent(result.getString(1), ignored -> new java.util.LinkedHashSet<>()).add(result.getString(2)); }
+        }
+        for (Map.Entry<String, java.util.LinkedHashSet<String>> entry : ids.entrySet()) {
+            String table = switch (entry.getKey()) {
+                case "EVENT" -> "memory_events";
+                case "SUMMARY" -> "memory_summary_versions";
+                case "CURRENT_SITUATION" -> "memory_current_situation_versions";
+                default -> throw new SQLException("Unknown derived source kind.");
+            };
+            String column = switch (entry.getKey()) {
+                case "EVENT" -> "event_id";
+                case "SUMMARY" -> "summary_version_id";
+                case "CURRENT_SITUATION" -> "situation_version_id";
+                default -> throw new SQLException("Unknown derived source kind.");
+            };
+            affected += deleteIn("DELETE FROM " + table + " WHERE " + column + " IN (", entry.getValue(), ")");
+        }
+        affected += deleteIn("DELETE FROM memory_derived_sources WHERE batch_id IN (", batchIds, ")");
+        return affected;
+    }
+
+    private int deleteDerived(String kind, String id) throws SQLException {
+        int affected = delete("DELETE FROM memory_derived_sources WHERE record_kind = ? AND record_id = ?", kind, id);
+        return affected + switch (kind) {
+            case "EVENT" -> delete("DELETE FROM memory_events WHERE event_id = ?", id);
+            case "SUMMARY" -> delete("DELETE FROM memory_summary_versions WHERE summary_version_id = ?", id);
+            case "CURRENT_SITUATION" -> delete("DELETE FROM memory_current_situation_versions WHERE situation_version_id = ?", id);
+            default -> 0;
+        };
+    }
+
+    private int deleteMemoryRecord(String id) throws SQLException {
+        return delete("DELETE FROM memory_confirmations WHERE record_id = ?", id) + delete("DELETE FROM memory_records WHERE record_id = ?", id);
+    }
+
+    private int updateOutcome(String batchId, boolean replyOnly) throws SQLException {
+        return replyOnly
+            ? delete("UPDATE journal_outcomes SET reply_state = 'DELETED', delivered_response = NULL WHERE batch_id = ?", batchId)
+            : delete("UPDATE journal_outcomes SET outcome_state = 'INVALIDATED', reply_state = 'DELETED', delivered_response = NULL WHERE batch_id = ?", batchId);
+    }
+
+    private int deletePayloads(java.util.Set<Long> observations) throws SQLException {
+        return observations.isEmpty() ? 0 : deleteIn("DELETE FROM journal_observation_payloads WHERE sequence IN (", observations, ")");
+    }
+
+    private int markObservationsUnavailable(java.util.Set<Long> observations, String state) throws SQLException {
+        if (observations.isEmpty()) return 0;
+        String sql = "UPDATE journal_observations SET player_uuid = NULL, raw_state = ?, raw_unavailable_at_epoch_millis = ? WHERE sequence IN (" + placeholders(observations.size()) + ")";
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, state); statement.setLong(2, Instant.now().toEpochMilli());
+            int parameter = 3;
+            for (Long value : observations) statement.setLong(parameter++, value);
+            return statement.executeUpdate();
+        }
+    }
+
+    private void incrementContentRevision() throws SQLException {
+        try (Statement statement = connection.createStatement()) {
+            statement.executeUpdate("UPDATE journal_metadata SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'content_revision'");
+        }
+    }
+
+    private void checkpointAfterDeletion(MemoryDeletionKind kind) throws SQLException {
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+            if (kind == MemoryDeletionKind.RESET_WORLD) statement.execute("VACUUM");
+        }
+    }
+
+    private boolean exists(String sql, Object... values) throws SQLException { return count(sql, values) > 0; }
+    private int count(String sql, Object... values) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            bind(statement, 1, values);
+            try (ResultSet rows = statement.executeQuery()) { return rows.next() ? rows.getInt(1) : 0; }
+        }
+    }
+    private int delete(String sql, Object... values) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(sql)) { bind(statement, 1, values); return statement.executeUpdate(); }
+    }
+    private int updateIn(String prefix, java.util.Set<String> values) throws SQLException { return deleteIn(prefix, values, ")"); }
+    private int deleteIn(String prefix, java.util.Set<?> values, String suffix) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(prefix + placeholders(values.size()) + suffix)) {
+            bindValues(statement, 1, values); return statement.executeUpdate();
+        }
+    }
+    private static String placeholders(int count) { return String.join(",", java.util.Collections.nCopies(count, "?")); }
+    private static void bindStrings(PreparedStatement statement, int parameter, java.util.Set<String> values) throws SQLException { bindValues(statement, parameter, values); }
+    private static void bindValues(PreparedStatement statement, int parameter, java.util.Set<?> values) throws SQLException {
+        for (Object value : values) { if (value instanceof Long number) statement.setLong(parameter++, number); else statement.setString(parameter++, String.valueOf(value)); }
+    }
+    private static void bind(PreparedStatement statement, int parameter, Object... values) throws SQLException {
+        for (Object value : values) { if (value instanceof Long number) statement.setLong(parameter++, number); else statement.setString(parameter++, String.valueOf(value)); }
+    }
+    private static Long parseSequenceIdentity(String identity, String prefix) {
+        try { return Long.parseLong(identity.substring(prefix.length())); } catch (RuntimeException ignored) { return null; }
+    }
+    private static String fingerprint(List<String> parts) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            for (String part : parts) { digest.update(part.getBytes(StandardCharsets.UTF_8)); digest.update((byte) 0); }
+            return java.util.HexFormat.of().formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException impossible) { throw new IllegalStateException("SHA-256 is unavailable.", impossible); }
+    }
+
+    private record DeletionClosure(java.util.Set<Long> observations, java.util.Set<String> batches, int affectedRecords, String fingerprint) { }
 
     private InspectionSql inspectionSelect(MemoryRecordType type, MemoryInspectionScope scope) {
         return switch (type) {
@@ -1660,6 +1950,8 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
                 statement.execute("CREATE VIEW journal_messages AS SELECT o.sequence, o.player_uuid, p.player_name, p.message_text, o.captured_at_epoch_millis, o.source, o.visibility, o.addressing_signal FROM journal_observations o JOIN journal_observation_payloads p ON p.sequence = o.sequence WHERE o.raw_state = 'AVAILABLE'");
                 statement.execute("CREATE TABLE journal_batch_messages (batch_id TEXT NOT NULL REFERENCES journal_batches(batch_id), message_sequence INTEGER NOT NULL REFERENCES journal_observations(sequence), ordinal INTEGER NOT NULL, PRIMARY KEY(batch_id, message_sequence), UNIQUE(batch_id, ordinal))");
                 statement.execute("INSERT INTO journal_batch_messages(batch_id, message_sequence, ordinal) SELECT batch_id, message_sequence, ordinal FROM journal_batch_messages_v1");
+                statement.execute("DROP TABLE journal_batch_messages_v1");
+                statement.execute("DROP TABLE journal_messages_v1");
             }
             createSchemaV2(connection);
             try (Statement statement = connection.createStatement()) {

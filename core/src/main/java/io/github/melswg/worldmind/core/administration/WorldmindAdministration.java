@@ -23,4 +23,12 @@ public interface WorldmindAdministration {
     );
 
     CompletionStage<MemoryExportResult> export(MemoryInspectionScope scope);
+
+    CompletionStage<MemoryDeletionPreview> prepareDeletion(MemoryDeletionRequest request);
+
+    CompletionStage<MemoryDeletionResult> confirmDeletion(ConfirmationToken token);
+
+    CompletionStage<MemoryDeletionPreview> prepareWorldReset();
+
+    CompletionStage<MemoryDeletionResult> confirmWorldReset(ConfirmationToken token);
 }

@@ -13,6 +13,11 @@ import io.github.melswg.worldmind.core.administration.MemoryInspectionScope;
 import io.github.melswg.worldmind.core.administration.MemoryRecordType;
 import io.github.melswg.worldmind.core.administration.MemoryExportRepository;
 import io.github.melswg.worldmind.core.administration.MemoryExportResult;
+import io.github.melswg.worldmind.core.administration.MemoryDeletionPreview;
+import io.github.melswg.worldmind.core.administration.MemoryDeletionRequest;
+import io.github.melswg.worldmind.core.administration.MemoryDeletionResult;
+import io.github.melswg.worldmind.core.administration.MemoryDeletionKind;
+import io.github.melswg.worldmind.core.administration.ConfirmationToken;
 import io.github.melswg.worldmind.core.administration.ProviderAvailability;
 import io.github.melswg.worldmind.core.administration.ReloadResult;
 import io.github.melswg.worldmind.core.administration.RuntimeLifecycleState;
@@ -36,6 +41,12 @@ import io.github.melswg.worldmind.fabric.provider.ProviderCredentialResolver;
 import io.github.melswg.worldmind.storage.sqlite.SqliteDialogueJournal;
 import java.nio.file.Path;
 import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.security.SecureRandom;
+import java.util.Base64;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -71,6 +82,10 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
     private final ExecutorService exportExecutor;
     private final WorldmindMemoryExportPublisher exportPublisher;
     private final AtomicBoolean reloadInProgress = new AtomicBoolean();
+    private final AtomicBoolean maintenanceInProgress = new AtomicBoolean();
+    private final Clock administrationClock = Clock.systemUTC();
+    private final SecureRandom confirmationEntropy = new SecureRandom();
+    private final Map<String, PendingConfirmation> confirmations = new LinkedHashMap<>();
 
     private WorldmindAuthoritativeRuntime runtime;
     private WorldmindIntegrationState integrationState;
@@ -132,6 +147,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
     }
 
     synchronized void onServerStarted(MinecraftServer startedServer) {
+        invalidateConfirmations();
         retireCurrentGeneration(true);
         server = startedServer;
         saveRoot = startedServer == null ? null : startedServer.getSavePath(WorldSavePath.ROOT);
@@ -154,6 +170,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
     }
 
     synchronized void onServerStopping(MinecraftServer ignored) {
+        invalidateConfirmations();
         lifecycleState = RuntimeLifecycleState.STOPPING;
         reloadState = RuntimeReloadState.IDLE;
         reloadInProgress.set(false);
@@ -248,7 +265,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
             if (lifecycleState != RuntimeLifecycleState.RUNNING) {
                 return CompletableFuture.completedFuture(MemoryInspectionResult.of(AdministrationResultCode.LIFECYCLE_NOT_READY));
             }
-            if (journal == null || storageHealth != StorageHealth.READY) {
+            if (maintenanceInProgress.get() || journal == null || storageHealth != StorageHealth.READY) {
                 return CompletableFuture.completedFuture(MemoryInspectionResult.of(AdministrationResultCode.STORAGE_NOT_READY));
             }
             repository = journal;
@@ -270,7 +287,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
             if (lifecycleState != RuntimeLifecycleState.RUNNING) {
                 return CompletableFuture.completedFuture(MemoryInspectionResult.of(AdministrationResultCode.LIFECYCLE_NOT_READY));
             }
-            if (journal == null || storageHealth != StorageHealth.READY) {
+            if (maintenanceInProgress.get() || journal == null || storageHealth != StorageHealth.READY) {
                 return CompletableFuture.completedFuture(MemoryInspectionResult.of(AdministrationResultCode.STORAGE_NOT_READY));
             }
             repository = journal;
@@ -291,7 +308,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
             if (lifecycleState != RuntimeLifecycleState.RUNNING) {
                 return CompletableFuture.completedFuture(MemoryExportResult.of(AdministrationResultCode.LIFECYCLE_NOT_READY));
             }
-            if (journal == null || worldIdentity == null || saveRoot == null || storageHealth != StorageHealth.READY) {
+            if (maintenanceInProgress.get() || journal == null || worldIdentity == null || saveRoot == null || storageHealth != StorageHealth.READY) {
                 return CompletableFuture.completedFuture(MemoryExportResult.of(AdministrationResultCode.STORAGE_NOT_READY));
             }
             repository = journal;
@@ -299,6 +316,95 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
             worldId = worldIdentity.identity().stableId();
         }
         return exportPublisher.export(repository, root, worldId, scope);
+    }
+
+    @Override
+    public CompletionStage<MemoryDeletionPreview> prepareDeletion(MemoryDeletionRequest request) {
+        Objects.requireNonNull(request, "request");
+        SqliteDialogueJournal repository;
+        long generation;
+        synchronized (this) {
+            if (lifecycleState != RuntimeLifecycleState.RUNNING) return CompletableFuture.completedFuture(MemoryDeletionPreview.of(AdministrationResultCode.LIFECYCLE_NOT_READY));
+            if (maintenanceInProgress.get()) return CompletableFuture.completedFuture(MemoryDeletionPreview.of(AdministrationResultCode.DELETION_IN_PROGRESS));
+            if (journal == null || storageHealth != StorageHealth.READY) return CompletableFuture.completedFuture(MemoryDeletionPreview.of(AdministrationResultCode.STORAGE_NOT_READY));
+            repository = journal;
+            generation = lifecycleGeneration;
+        }
+        return repository.prepareDeletion(request).thenApply(preview -> {
+            if (preview.code() != AdministrationResultCode.SUCCESS || preview.targetFingerprint().isEmpty()) return preview;
+            synchronized (this) {
+                if (generation != lifecycleGeneration || repository != journal || maintenanceInProgress.get()) {
+                    return MemoryDeletionPreview.of(AdministrationResultCode.TARGET_CHANGED);
+                }
+                if (confirmations.size() >= 32) return MemoryDeletionPreview.of(AdministrationResultCode.DELETION_IN_PROGRESS);
+                ConfirmationToken token = nextConfirmationToken();
+                Instant expiresAt = administrationClock.instant().plusSeconds(60);
+                confirmations.put(token.value(), new PendingConfirmation(request, generation, preview.targetFingerprint().orElseThrow(), expiresAt));
+                return new MemoryDeletionPreview(AdministrationResultCode.CONFIRMATION_REQUIRED, Optional.of(token),
+                    preview.affectedRecords(), Optional.of(expiresAt), Optional.empty());
+            }
+        }).exceptionally(ignored -> MemoryDeletionPreview.of(AdministrationResultCode.STORAGE_UNAVAILABLE));
+    }
+
+    @Override
+    public CompletionStage<MemoryDeletionPreview> prepareWorldReset() {
+        return prepareDeletion(MemoryDeletionRequest.worldReset());
+    }
+
+    @Override
+    public CompletionStage<MemoryDeletionResult> confirmDeletion(ConfirmationToken token) {
+        return confirm(token, MemoryDeletionKind.DELETE_RECORD, MemoryDeletionKind.DELETE_PLAYER);
+    }
+
+    @Override
+    public CompletionStage<MemoryDeletionResult> confirmWorldReset(ConfirmationToken token) {
+        return confirm(token, MemoryDeletionKind.RESET_WORLD);
+    }
+
+    private CompletionStage<MemoryDeletionResult> confirm(ConfirmationToken token, MemoryDeletionKind... acceptedKinds) {
+        Objects.requireNonNull(token, "token");
+        PendingConfirmation pending;
+        SqliteDialogueJournal repository;
+        FabricChatObservationRuntime retiring;
+        long operationGeneration;
+        synchronized (this) {
+            pending = confirmations.get(token.value());
+            if (pending == null) return CompletableFuture.completedFuture(MemoryDeletionResult.of(AdministrationResultCode.CONFIRMATION_INVALID, MemoryDeletionKind.DELETE_RECORD));
+            if (pending.expiresAt().isBefore(administrationClock.instant())) {
+                confirmations.remove(token.value());
+                return CompletableFuture.completedFuture(MemoryDeletionResult.of(AdministrationResultCode.CONFIRMATION_EXPIRED, pending.request().kind()));
+            }
+            boolean accepted = java.util.Arrays.stream(acceptedKinds).anyMatch(value -> value == pending.request().kind());
+            if (!accepted) return CompletableFuture.completedFuture(MemoryDeletionResult.of(AdministrationResultCode.CONFIRMATION_INVALID, pending.request().kind()));
+            if (pending.generation() != lifecycleGeneration || journal == null || storageHealth != StorageHealth.READY) {
+                confirmations.remove(token.value());
+                return CompletableFuture.completedFuture(MemoryDeletionResult.of(AdministrationResultCode.TARGET_CHANGED, pending.request().kind()));
+            }
+            if (!maintenanceInProgress.compareAndSet(false, true)) {
+                return CompletableFuture.completedFuture(MemoryDeletionResult.of(AdministrationResultCode.DELETION_IN_PROGRESS, pending.request().kind()));
+            }
+            confirmations.remove(token.value());
+            exportPublisher.cancelActive();
+            operationGeneration = ++lifecycleGeneration;
+            retiring = chatObservation;
+            chatObservation = null;
+            pendingJournalStart = null;
+            repository = journal;
+        }
+        CompletionStage<Void> barrier = retiring == null ? CompletableFuture.completedFuture(null) : retiring.retireForReload();
+        return barrier.handle((ignored, failure) -> null).thenCompose(ignored -> repository.executeDeletion(pending.request(), pending.fingerprint()))
+            .handle((result, failure) -> {
+                MemoryDeletionResult safe = failure == null && result != null
+                    ? result : MemoryDeletionResult.of(AdministrationResultCode.STORAGE_UNAVAILABLE, pending.request().kind());
+                synchronized (this) {
+                    maintenanceInProgress.set(false);
+                    if (safe.code() == AdministrationResultCode.SUCCESS) invalidateConfirmations();
+                    if (operationGeneration == lifecycleGeneration && lifecycleState == RuntimeLifecycleState.RUNNING) {
+                        installChatRuntimeIfReady(server, operationGeneration);
+                    }
+                }
+                return safe;
+            });
     }
 
     @Override
@@ -315,6 +421,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
             if (!reloadInProgress.compareAndSet(false, true)) {
                 return CompletableFuture.completedFuture(ReloadResult.of(AdministrationResultCode.RELOAD_IN_PROGRESS));
             }
+            invalidateConfirmations();
             exportPublisher.cancelActive();
             reloadState = RuntimeReloadState.VALIDATING;
         }
@@ -496,6 +603,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
     }
 
     private void retireCurrentGeneration(boolean closeJournal) {
+        invalidateConfirmations();
         exportPublisher.cancelActive();
         commandBroadcastCorrelation.clear();
         FabricChatObservationRuntime retiring = chatObservation;
@@ -586,6 +694,16 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
         };
     }
 
+    private ConfirmationToken nextConfirmationToken() {
+        byte[] entropy = new byte[16];
+        confirmationEntropy.nextBytes(entropy);
+        return new ConfirmationToken(Base64.getUrlEncoder().withoutPadding().encodeToString(entropy));
+    }
+
+    private void invalidateConfirmations() {
+        confirmations.clear();
+    }
+
     private FabricSignedMessageCorrelationKey correlationKey(SignedMessage message) {
         MessageLink link = message.link();
         return new FabricSignedMessageCorrelationKey(link.sender(), link.sessionId(), link.index(), message.getTimestamp(), message.getSalt());
@@ -597,6 +715,8 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
     }
 
     private record WorldIdentityLifecycle(WorldIdentity identity) { }
+
+    private record PendingConfirmation(MemoryDeletionRequest request, long generation, String fingerprint, Instant expiresAt) { }
 
     /** Captures observations while a generation waits for its persistent world identity. */
     private static final class PendingJournalStart {
