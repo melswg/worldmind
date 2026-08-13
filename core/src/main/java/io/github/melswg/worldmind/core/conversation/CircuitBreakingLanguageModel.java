@@ -30,6 +30,6 @@ public final class CircuitBreakingLanguageModel implements LanguageModel {
                 breaker.record(permit, resolved);
                 return resolved;
             });
-        }).orElseGet(() -> CompletableFuture.completedFuture(new ProviderRefusal(RefusalCode.PROVIDER_UNAVAILABLE)));
+        }).orElseGet(() -> CompletableFuture.completedFuture(new ProviderRefusal(RefusalCode.PROVIDER_CIRCUIT_OPEN)));
     }
 }

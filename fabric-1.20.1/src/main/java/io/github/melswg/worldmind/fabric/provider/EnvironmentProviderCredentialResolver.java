@@ -42,18 +42,25 @@ public final class EnvironmentProviderCredentialResolver implements ProviderCred
 
     @Override
     public Optional<ProviderCredential> resolveForOutgoingRequest(ExternalSecretReference reference) {
+        return resolveForOutgoingRequestResult(reference).credential();
+    }
+
+    @Override
+    public ProviderCredentialResolution resolveForOutgoingRequestResult(ExternalSecretReference reference) {
         Matcher matcher = matcher(reference);
         if (matcher == null) {
-            return Optional.empty();
+            return ProviderCredentialResolution.unavailable(SecretAvailability.UNREADABLE);
         }
         try {
             String material = environment.apply(matcher.group(1));
             if (material != null && !material.isBlank()) {
                 SecretRedactionPolicy.register(material);
             }
-            return material == null || material.isBlank() ? Optional.empty() : Optional.of(new ProviderCredential(material));
+            return material == null || material.isBlank()
+                ? ProviderCredentialResolution.unavailable(SecretAvailability.MISSING)
+                : new ProviderCredentialResolution(SecretAvailability.AVAILABLE, Optional.of(new ProviderCredential(material)));
         } catch (RuntimeException failure) {
-            return Optional.empty();
+            return ProviderCredentialResolution.unavailable(SecretAvailability.UNREADABLE);
         }
     }
 

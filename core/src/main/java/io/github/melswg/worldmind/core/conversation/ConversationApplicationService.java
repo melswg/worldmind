@@ -139,9 +139,12 @@ public final class ConversationApplicationService {
             case HTTP_SERVER_ERROR -> RefusalCode.PROVIDER_SERVER_ERROR;
             case HTTP_AUTHENTICATION -> RefusalCode.PROVIDER_AUTHENTICATION_FAILURE;
             case HTTP_NON_RETRYABLE -> RefusalCode.PROVIDER_HTTP_FAILURE;
+            case INCOMPATIBLE_MODEL_OR_PARAMETER -> RefusalCode.INCOMPATIBLE_PROVIDER_CONFIGURATION;
             case MALFORMED_JSON -> RefusalCode.MALFORMED_PROVIDER_JSON;
+            case MALFORMED_RESPONSE -> RefusalCode.MALFORMED_PROVIDER_RESPONSE;
             case EMPTY_CONTENT -> RefusalCode.EMPTY_RESPONSE;
             case OVERSIZED_CONTENT -> RefusalCode.OVERSIZED_PROVIDER_CONTENT;
+            case CANCELLED -> RefusalCode.PROVIDER_CANCELLED;
         };
     }
 }

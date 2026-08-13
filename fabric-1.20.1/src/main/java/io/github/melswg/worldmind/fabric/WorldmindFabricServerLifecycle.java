@@ -35,9 +35,10 @@ import io.github.melswg.worldmind.core.conversation.ProviderCapabilities;
 import io.github.melswg.worldmind.core.conversation.ProviderCircuitSnapshot;
 import io.github.melswg.worldmind.core.conversation.WorldIdentity;
 import io.github.melswg.worldmind.fabric.configuration.WorldmindStartupConfigurationLoader;
-import io.github.melswg.worldmind.fabric.provider.CustomOpenAiCompatibleLanguageModel;
+import io.github.melswg.worldmind.fabric.provider.BuiltInProviderPresetRegistry;
 import io.github.melswg.worldmind.fabric.provider.EnvironmentProviderCredentialResolver;
 import io.github.melswg.worldmind.fabric.provider.ProviderCredentialResolver;
+import io.github.melswg.worldmind.fabric.provider.ProviderRuntimeHandle;
 import io.github.melswg.worldmind.storage.sqlite.SqliteDialogueJournal;
 import java.nio.file.Path;
 import java.time.Clock;
@@ -77,6 +78,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
     private final AuthoritativeWorldmindInitializer authoritativeInitializer;
     private final WorldmindStartupConfigurationLoader configurationLoader;
     private final ProviderCredentialResolver providerCredentials;
+    private final BuiltInProviderPresetRegistry providerPresets;
     private final FabricCommandBroadcastCorrelation commandBroadcastCorrelation = new FabricCommandBroadcastCorrelation();
     private final ExecutorService administrationExecutor;
     private final ExecutorService exportExecutor;
@@ -90,6 +92,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
     private WorldmindAuthoritativeRuntime runtime;
     private WorldmindIntegrationState integrationState;
     private FabricChatObservationRuntime chatObservation;
+    private ProviderRuntimeHandle providerRuntime;
     private SqliteDialogueJournal journal;
     private WorldIdentityLifecycle worldIdentity;
     private PendingJournalStart pendingJournalStart;
@@ -127,7 +130,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
         WorldmindStartupConfigurationLoader configurationLoader,
         ProviderCredentialResolver providerCredentials
     ) {
-        this(authoritativeInitializer, configurationLoader, providerCredentials, Executors.newSingleThreadExecutor(
+        this(authoritativeInitializer, configurationLoader, providerCredentials, BuiltInProviderPresetRegistry.standard(), Executors.newSingleThreadExecutor(
             daemonThreadFactory("worldmind-administration")
         ));
     }
@@ -138,9 +141,20 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
         ProviderCredentialResolver providerCredentials,
         ExecutorService administrationExecutor
     ) {
+        this(authoritativeInitializer, configurationLoader, providerCredentials, BuiltInProviderPresetRegistry.standard(), administrationExecutor);
+    }
+
+    WorldmindFabricServerLifecycle(
+        AuthoritativeWorldmindInitializer authoritativeInitializer,
+        WorldmindStartupConfigurationLoader configurationLoader,
+        ProviderCredentialResolver providerCredentials,
+        BuiltInProviderPresetRegistry providerPresets,
+        ExecutorService administrationExecutor
+    ) {
         this.authoritativeInitializer = Objects.requireNonNull(authoritativeInitializer, "authoritativeInitializer");
         this.configurationLoader = Objects.requireNonNull(configurationLoader, "configurationLoader");
         this.providerCredentials = Objects.requireNonNull(providerCredentials, "providerCredentials");
+        this.providerPresets = Objects.requireNonNull(providerPresets, "providerPresets");
         this.administrationExecutor = Objects.requireNonNull(administrationExecutor, "administrationExecutor");
         this.exportExecutor = Executors.newSingleThreadExecutor(daemonThreadFactory("worldmind-memory-export"));
         this.exportPublisher = new WorldmindMemoryExportPublisher(exportExecutor, Clock.systemUTC());
@@ -243,6 +257,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
             enabled != null,
             disableReason,
             enabled == null ? Optional.empty() : Optional.of(enabled.configuration().globalConfiguration().activeProfile()),
+            enabled == null ? Optional.empty() : Optional.of(enabled.configuration().globalConfiguration().provider().providerId()),
             providerAvailability(enabled),
             batching,
             work.orElse(new WorkStatus(0, 0, lifecycleState == RuntimeLifecycleState.STOPPED, 0, 0)),
@@ -506,13 +521,14 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
             enabled.configuration().profile().chatNameColor());
         pendingJournalStart = pending;
         try {
+            providerRuntime = providerPresets.create(enabled.configuration().globalConfiguration().provider(), providerCredentials);
             FabricChatObservationRuntime created = FabricChatObservationRuntime.createProduction(
                 target,
                 worldIdentity.identity(),
                 journal,
                 enabled.configuration(),
-                CustomOpenAiCompatibleLanguageModel.create(enabled.configuration().globalConfiguration().provider(), providerCredentials),
-                new ProviderCapabilities(true),
+                providerRuntime.languageModel(),
+                providerRuntime.capabilities(),
                 this::logDeliveryDiagnostic
             );
             chatObservation = created;
@@ -522,6 +538,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
             }
         } catch (RuntimeException failure) {
             pendingJournalStart = null;
+            providerRuntime = null;
             LOGGER.warn("Worldmind chat runtime could not start: {}.", failure.getClass().getSimpleName());
         }
     }
@@ -640,6 +657,7 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
         FabricChatObservationRuntime retiring = chatObservation;
         SqliteDialogueJournal closingJournal = journal;
         chatObservation = null;
+        providerRuntime = null;
         journal = null;
         worldIdentity = null;
         pendingJournalStart = null;
@@ -656,13 +674,14 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
             if (circuit != null && circuit.state() != io.github.melswg.worldmind.core.conversation.ProviderCircuitState.CLOSED) {
                 return ProviderAvailability.CIRCUIT_BLOCKED;
             }
-            return ProviderAvailability.READY;
+            return providerRuntime == null ? ProviderAvailability.READY : providerRuntime.availability().get();
         }
         if (integrationState instanceof DisabledWorldmindIntegration disabled) {
             return switch (disabled.reason()) {
                 case DISABLED_BY_OPERATOR -> ProviderAvailability.DISABLED;
                 case CREDENTIAL_REJECTED -> ProviderAvailability.CREDENTIAL_REJECTED;
-                case SECRET_UNAVAILABLE -> ProviderAvailability.SECRET_UNREADABLE;
+                case SECRET_MISSING -> ProviderAvailability.SECRET_MISSING;
+                case SECRET_UNREADABLE -> ProviderAvailability.SECRET_UNREADABLE;
                 default -> ProviderAvailability.NOT_READY;
             };
         }

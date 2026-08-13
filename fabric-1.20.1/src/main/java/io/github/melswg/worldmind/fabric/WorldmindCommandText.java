@@ -19,6 +19,7 @@ final class WorldmindCommandText {
             + " integration=" + (status.integrationEnabled() ? "ENABLED" : "DISABLED")
             + status.activeProfile().map(value -> " profile=" + value).orElse("")
             + status.disableReason().map(value -> " disableReason=" + value).orElse("")
+            + status.providerPresetId().map(value -> " preset=" + value).orElse(" preset=none")
             + " provider=" + status.providerAvailability()
             + " queue=" + status.work().queued() + "/" + status.work().inFlight() + "/" + status.work().closed()
             + " retry=" + status.work().retryAttempts() + "/" + status.work().waitingBackoff()

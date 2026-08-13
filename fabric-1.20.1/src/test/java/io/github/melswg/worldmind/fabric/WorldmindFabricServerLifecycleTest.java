@@ -63,7 +63,7 @@ class WorldmindFabricServerLifecycleTest {
             runtime.integrationState()
         );
         assertEquals(AuthoritativeInitializationPath.LOGICAL_SERVER, runtime.initializationPath());
-        assertEquals(IntegrationDisableReason.SECRET_UNAVAILABLE, disabled.reason());
+        assertEquals(IntegrationDisableReason.SECRET_MISSING, disabled.reason());
         assertEquals(1, secrets.resolutionCount());
     }
 

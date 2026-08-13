@@ -16,6 +16,7 @@ public record RuntimeStatusSnapshot(
     boolean integrationEnabled,
     Optional<IntegrationDisableReason> disableReason,
     Optional<String> activeProfile,
+    Optional<String> providerPresetId,
     ProviderAvailability providerAvailability,
     Optional<ChatBatchingStatus> batching,
     WorkStatus work,
@@ -28,6 +29,7 @@ public record RuntimeStatusSnapshot(
         Objects.requireNonNull(reload, "reload");
         disableReason = optional(disableReason, "disableReason");
         activeProfile = optional(activeProfile, "activeProfile");
+        providerPresetId = optional(providerPresetId, "providerPresetId");
         Objects.requireNonNull(providerAvailability, "providerAvailability");
         batching = optional(batching, "batching");
         Objects.requireNonNull(work, "work");
@@ -37,6 +39,17 @@ public record RuntimeStatusSnapshot(
         if (integrationEnabled && disableReason.isPresent()) {
             throw new IllegalArgumentException("Enabled integration has no disable reason.");
         }
+    }
+
+    /** Source-compatible construction for status producers predating provider presets. */
+    public RuntimeStatusSnapshot(
+        RuntimeLifecycleState lifecycle, RuntimeReloadState reload, boolean integrationEnabled,
+        Optional<IntegrationDisableReason> disableReason, Optional<String> activeProfile,
+        ProviderAvailability providerAvailability, Optional<ChatBatchingStatus> batching, WorkStatus work,
+        Optional<ProviderCircuitSnapshot> circuit, StorageHealth storage, CompactionStatus compaction
+    ) {
+        this(lifecycle, reload, integrationEnabled, disableReason, activeProfile, Optional.empty(), providerAvailability,
+            batching, work, circuit, storage, compaction);
     }
 
     private static <T> Optional<T> optional(Optional<T> value, String name) {

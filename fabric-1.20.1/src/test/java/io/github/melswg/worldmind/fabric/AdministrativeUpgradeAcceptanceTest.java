@@ -49,7 +49,7 @@ class AdministrativeUpgradeAcceptanceTest {
         writeV1Configuration(config);
         WorldmindStartupConfigurationLoader loader = new WorldmindStartupConfigurationLoader(config, WorldmindTestkit.secretResolver());
         assertInstanceOf(EnabledWorldmindIntegration.class, loader.loadAndMigrate());
-        assertTrue(Files.readString(config.resolve("worldmind.json")).contains("\"schemaVersion\":2"));
+        assertTrue(Files.readString(config.resolve("worldmind.json")).contains("\"schemaVersion\":3"));
         assertTrue(Files.list(config.resolve("backups/config")).anyMatch(Files::isDirectory));
 
         Path save = temporaryDirectory.resolve("save");

@@ -14,4 +14,20 @@ public interface ProviderCredentialResolver extends SecretResolver {
      * Callers must not retain, log, or expose the returned value.
      */
     Optional<ProviderCredential> resolveForOutgoingRequest(ExternalSecretReference reference);
+
+    /**
+     * A typed variation of the transport-only lookup. Existing resolvers keep
+     * their compatibility method; production can preserve missing versus
+     * unreadable material without exposing it beyond this boundary.
+     */
+    default ProviderCredentialResolution resolveForOutgoingRequestResult(ExternalSecretReference reference) {
+        return resolveForOutgoingRequest(reference)
+            .<ProviderCredentialResolution>map(value -> new ProviderCredentialResolution(
+                io.github.melswg.worldmind.core.configuration.SecretAvailability.AVAILABLE,
+                Optional.of(value)
+            ))
+            .orElseGet(() -> ProviderCredentialResolution.unavailable(
+                io.github.melswg.worldmind.core.configuration.SecretAvailability.MISSING
+            ));
+    }
 }

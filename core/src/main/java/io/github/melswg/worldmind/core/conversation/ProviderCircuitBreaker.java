@@ -47,7 +47,8 @@ public final class ProviderCircuitBreaker {
 
     private boolean qualifies(LanguageModelResult result) {
         return result instanceof ProviderFailure failure && switch (failure.kind()) {
-            case CONNECTION_FAILURE, TIMEOUT, HTTP_RATE_LIMITED, HTTP_SERVER_ERROR, MALFORMED_JSON, EMPTY_CONTENT, OVERSIZED_CONTENT -> true;
+            case CONNECTION_FAILURE, TIMEOUT, HTTP_RATE_LIMITED, HTTP_SERVER_ERROR, MALFORMED_JSON,
+                MALFORMED_RESPONSE, EMPTY_CONTENT, OVERSIZED_CONTENT -> true;
             default -> false;
         };
     }

@@ -14,10 +14,11 @@ public record WorldmindGlobalConfiguration(
 ) {
     public static final int V1_SCHEMA_VERSION = 1;
     public static final int V2_SCHEMA_VERSION = 2;
-    public static final int CURRENT_SCHEMA_VERSION = V2_SCHEMA_VERSION;
+    public static final int V3_SCHEMA_VERSION = 3;
+    public static final int CURRENT_SCHEMA_VERSION = V3_SCHEMA_VERSION;
 
     public WorldmindGlobalConfiguration {
-        if (schemaVersion != V1_SCHEMA_VERSION && schemaVersion != V2_SCHEMA_VERSION) {
+        if (schemaVersion != V1_SCHEMA_VERSION && schemaVersion != V2_SCHEMA_VERSION && schemaVersion != V3_SCHEMA_VERSION) {
             throw new IllegalArgumentException("schemaVersion must be a supported Worldmind global schema.");
         }
         Objects.requireNonNull(activeProfile, "activeProfile");

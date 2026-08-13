@@ -71,16 +71,16 @@ public final class RetryingLanguageModel implements LanguageModel {
                 if (result.isDone()) return;
                 LanguageModelResult resolved = failure == null && value != null
                     ? value : new ProviderFailure(ProviderFailureKind.CONNECTION_FAILURE);
-                if (isTransient(resolved) && number < policy.maximumAttempts()) {
-                    scheduleRetry(number + 1, number);
+                if (isTransient(resolved) && retryAllowedByHint(resolved) && number < policy.maximumAttempts()) {
+                    scheduleRetry(number + 1, number, resolved);
                 } else {
                     result.complete(resolved);
                 }
             });
         }
 
-        private void scheduleRetry(int nextAttempt, int failedAttempt) {
-            long delay = delayFor(failedAttempt);
+        private void scheduleRetry(int nextAttempt, int failedAttempt, LanguageModelResult failedResult) {
+            long delay = delayFor(failedAttempt, failedResult);
             waitingBackoff.incrementAndGet();
             backoffCounted = true;
             pendingBackoff = scheduler.schedule(Duration.ofMillis(delay), () -> {
@@ -89,14 +89,22 @@ public final class RetryingLanguageModel implements LanguageModel {
             });
         }
 
-        private long delayFor(int failedAttempt) {
+        private long delayFor(int failedAttempt, LanguageModelResult failedResult) {
             long base = policy.initialBackoffMillis();
             for (int index = 1; index < failedAttempt && base < policy.maximumBackoffMillis(); index++) {
                 base = Math.min(policy.maximumBackoffMillis(), Math.multiplyExact(base, 2));
             }
             long variation = (long) Math.floor(base * policy.jitterRatio());
             double unit = Math.max(-1.0, Math.min(1.0, jitter.nextUnitJitter()));
-            return Math.max(0, Math.min(policy.maximumBackoffMillis(), base + Math.round(variation * unit)));
+            long localDelay = Math.max(0, Math.min(policy.maximumBackoffMillis(), base + Math.round(variation * unit)));
+            long serverDelay = failedResult instanceof ProviderFailure providerFailure
+                ? providerFailure.retryAfter().map(Duration::toMillis).orElse(0L) : 0L;
+            return Math.max(localDelay, serverDelay);
+        }
+
+        private boolean retryAllowedByHint(LanguageModelResult result) {
+            if (!(result instanceof ProviderFailure failure)) return true;
+            return failure.retryAfter().map(value -> value.toMillis() <= policy.maximumBackoffMillis()).orElse(true);
         }
 
         private boolean isTransient(LanguageModelResult result) {

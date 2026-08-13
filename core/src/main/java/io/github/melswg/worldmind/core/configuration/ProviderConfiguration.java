@@ -1,11 +1,12 @@
 package io.github.melswg.worldmind.core.configuration;
 
 import java.util.Objects;
+import java.util.Optional;
 
 /** Validated provider selection and non-secret generation settings. */
 public record ProviderConfiguration(
     String providerId,
-    ProviderEndpoint endpoint,
+    Optional<ProviderEndpoint> endpoint,
     String model,
     GenerationParameters generationParameters,
     ExternalSecretReference secretReference,
@@ -15,7 +16,7 @@ public record ProviderConfiguration(
 ) {
     public ProviderConfiguration {
         providerId = requireText(providerId, "providerId");
-        Objects.requireNonNull(endpoint, "endpoint");
+        endpoint = Objects.requireNonNull(endpoint, "endpoint");
         model = requireText(model, "model");
         Objects.requireNonNull(generationParameters, "generationParameters");
         Objects.requireNonNull(secretReference, "secretReference");
@@ -32,17 +33,17 @@ public record ProviderConfiguration(
         GenerationParameters generationParameters,
         ExternalSecretReference secretReference
     ) {
-        this(providerId, endpoint, model, generationParameters, secretReference, ProviderTimeoutConfiguration.DEFAULT, ProviderRetryConfiguration.DEFAULT, ProviderCircuitBreakerConfiguration.DEFAULT);
+        this(providerId, Optional.of(Objects.requireNonNull(endpoint, "endpoint")), model, generationParameters, secretReference, ProviderTimeoutConfiguration.DEFAULT, ProviderRetryConfiguration.DEFAULT, ProviderCircuitBreakerConfiguration.DEFAULT);
     }
 
     public ProviderConfiguration(String providerId, ProviderEndpoint endpoint, String model, GenerationParameters generationParameters,
                                  ExternalSecretReference secretReference, ProviderTimeoutConfiguration timeouts) {
-        this(providerId, endpoint, model, generationParameters, secretReference, timeouts, ProviderRetryConfiguration.DEFAULT, ProviderCircuitBreakerConfiguration.DEFAULT);
+        this(providerId, Optional.of(Objects.requireNonNull(endpoint, "endpoint")), model, generationParameters, secretReference, timeouts, ProviderRetryConfiguration.DEFAULT, ProviderCircuitBreakerConfiguration.DEFAULT);
     }
 
     public ProviderConfiguration(String providerId, ProviderEndpoint endpoint, String model, GenerationParameters generationParameters,
                                  ExternalSecretReference secretReference, ProviderTimeoutConfiguration timeouts, ProviderRetryConfiguration retry) {
-        this(providerId, endpoint, model, generationParameters, secretReference, timeouts, retry, ProviderCircuitBreakerConfiguration.DEFAULT);
+        this(providerId, Optional.of(Objects.requireNonNull(endpoint, "endpoint")), model, generationParameters, secretReference, timeouts, retry, ProviderCircuitBreakerConfiguration.DEFAULT);
     }
 
     private static String requireText(String value, String name) {

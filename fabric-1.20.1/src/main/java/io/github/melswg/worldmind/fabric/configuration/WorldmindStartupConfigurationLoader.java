@@ -6,6 +6,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.JsonParseException;
 import io.github.melswg.worldmind.core.configuration.ConfigurationDiagnostic;
+import io.github.melswg.worldmind.core.configuration.ConfigurationDiagnosticCode;
 import io.github.melswg.worldmind.core.configuration.ChatNameColor;
 import io.github.melswg.worldmind.core.configuration.ChatBatchingConfiguration;
 import io.github.melswg.worldmind.core.configuration.DisabledWorldmindIntegration;
@@ -28,6 +29,7 @@ import io.github.melswg.worldmind.core.configuration.ValidatedWorldmindConfigura
 import io.github.melswg.worldmind.core.configuration.WorldmindGlobalConfiguration;
 import io.github.melswg.worldmind.core.configuration.WorldmindIntegrationState;
 import io.github.melswg.worldmind.core.configuration.WorldmindProfile;
+import io.github.melswg.worldmind.fabric.provider.BuiltInProviderPresetRegistry;
 import java.io.IOException;
 import java.io.Reader;
 import java.math.BigDecimal;
@@ -54,7 +56,7 @@ import java.util.UUID;
 import java.util.regex.Pattern;
 
 /**
- * Reads strict v1 compatibility input and the current v2 filesystem format at
+ * Reads strict v1 compatibility input and the current v3 filesystem format at
  * {@code config/worldmind}. JSON is confined to this Fabric adapter; core sees
  * only validated, JSON-library-independent values.
  */
@@ -75,6 +77,7 @@ public final class WorldmindStartupConfigurationLoader {
     private static final Set<String> GLOBAL_FIELDS_V2 = Set.of(
         "schemaVersion", "enabled", "activeProfile", "provider", "chatBatching", "requestQueue", "dialogueRetention"
     );
+    private static final Set<String> GLOBAL_FIELDS_V3 = GLOBAL_FIELDS_V2;
     private static final Set<String> RETENTION_FIELDS = Set.of(
         "persistRawObservations", "maximumRawAgeDays", "useInRecentContext", "useInCompaction", "useInRetrieval"
     );
@@ -102,10 +105,20 @@ public final class WorldmindStartupConfigurationLoader {
 
     private final Path configurationDirectory;
     private final SecretResolver secretResolver;
+    private final BuiltInProviderPresetRegistry providerPresets;
 
     public WorldmindStartupConfigurationLoader(Path configurationDirectory, SecretResolver secretResolver) {
+        this(configurationDirectory, secretResolver, BuiltInProviderPresetRegistry.standard());
+    }
+
+    public WorldmindStartupConfigurationLoader(
+        Path configurationDirectory,
+        SecretResolver secretResolver,
+        BuiltInProviderPresetRegistry providerPresets
+    ) {
         this.configurationDirectory = Objects.requireNonNull(configurationDirectory, "configurationDirectory");
         this.secretResolver = Objects.requireNonNull(secretResolver, "secretResolver");
+        this.providerPresets = Objects.requireNonNull(providerPresets, "providerPresets");
     }
 
     /**
@@ -174,13 +187,14 @@ public final class WorldmindStartupConfigurationLoader {
         if (availability == SecretAvailability.REJECTED) {
             return disabled(
                 IntegrationDisableReason.CREDENTIAL_REJECTED,
-                List.of(new ConfigurationDiagnostic("global.provider.secretReference", "Credential material was rejected."))
+                List.of(new ConfigurationDiagnostic(ConfigurationDiagnosticCode.CREDENTIAL_REJECTED,
+                    "global.provider.secretReference", "Credential material was rejected."))
             );
         }
         if (availability == null || availability == SecretAvailability.UNREADABLE) {
             return disabled(
-                IntegrationDisableReason.SECRET_UNAVAILABLE,
-                List.of(new ConfigurationDiagnostic(
+                IntegrationDisableReason.SECRET_UNREADABLE,
+                List.of(new ConfigurationDiagnostic(ConfigurationDiagnosticCode.CREDENTIAL_UNREADABLE,
                     "global.provider.secretReference",
                     "Secret material is unavailable or unreadable."
                 ))
@@ -188,8 +202,9 @@ public final class WorldmindStartupConfigurationLoader {
         }
         if (availability == SecretAvailability.MISSING) {
             return disabled(
-                IntegrationDisableReason.SECRET_UNAVAILABLE,
-                List.of(new ConfigurationDiagnostic("global.provider.secretReference", "Secret material is missing."))
+                IntegrationDisableReason.SECRET_MISSING,
+                List.of(new ConfigurationDiagnostic(ConfigurationDiagnosticCode.CREDENTIAL_MISSING,
+                    "global.provider.secretReference", "Secret material is missing."))
             );
         }
 
@@ -197,7 +212,7 @@ public final class WorldmindStartupConfigurationLoader {
     }
 
     /**
-     * Startup/reload-only v1→v2 upgrade. It validates the old bundle first,
+     * Startup/reload-only ordered v1→v2→v3 upgrade. It validates the old bundle first,
      * publishes a CREATE_NEW backup, then atomically replaces only the global
      * JSON. Profiles are independently versioned and remain v1 today.
      */
@@ -223,19 +238,25 @@ public final class WorldmindStartupConfigurationLoader {
             if (!parsed.isJsonObject()) return null;
             JsonObject source = parsed.getAsJsonObject();
             JsonElement version = source.get("schemaVersion");
-            if (!isNumber(version) || version.getAsInt() != WorldmindGlobalConfiguration.V1_SCHEMA_VERSION) return null;
+            if (!isNumber(version) || (version.getAsInt() != WorldmindGlobalConfiguration.V1_SCHEMA_VERSION
+                && version.getAsInt() != WorldmindGlobalConfiguration.V2_SCHEMA_VERSION)) return null;
             String activeProfile = isString(source.get("activeProfile")) ? source.get("activeProfile").getAsString() : null;
             if (activeProfile == null || !PROFILE_ID.matcher(activeProfile).matches()) return null;
             Path profile = configurationDirectory.resolve("profiles").resolve(activeProfile).resolve(PROFILE_FILE_NAME);
             JsonObject target = source.deepCopy();
-            target.addProperty("schemaVersion", WorldmindGlobalConfiguration.V2_SCHEMA_VERSION);
-            JsonObject retention = new JsonObject();
-            retention.addProperty("persistRawObservations", true);
-            retention.addProperty("maximumRawAgeDays", 0);
-            retention.addProperty("useInRecentContext", true);
-            retention.addProperty("useInCompaction", true);
-            retention.addProperty("useInRetrieval", true);
-            target.add("dialogueRetention", retention);
+            if (version.getAsInt() == WorldmindGlobalConfiguration.V1_SCHEMA_VERSION) {
+                JsonObject retention = new JsonObject();
+                retention.addProperty("persistRawObservations", true);
+                retention.addProperty("maximumRawAgeDays", 0);
+                retention.addProperty("useInRecentContext", true);
+                retention.addProperty("useInCompaction", true);
+                retention.addProperty("useInRetrieval", true);
+                target.add("dialogueRetention", retention);
+            }
+            JsonElement provider = target.get("provider");
+            if (provider == null || !provider.isJsonObject() || !CUSTOM_OPENAI_COMPATIBLE.equals(stringValue(provider.getAsJsonObject().get("id")))
+                || !provider.getAsJsonObject().has("endpoint")) return null;
+            target.addProperty("schemaVersion", WorldmindGlobalConfiguration.V3_SCHEMA_VERSION);
             return new MigrationCandidate(global, profile, Files.readAllBytes(global), Files.readAllBytes(profile), target.toString());
         } catch (IOException | RuntimeException invalid) {
             return null;
@@ -305,16 +326,16 @@ public final class WorldmindStartupConfigurationLoader {
         }
         Integer schemaVersion = requiredInteger(global, "schemaVersion", "global", diagnostics);
         if (schemaVersion != null && schemaVersion != WorldmindGlobalConfiguration.V1_SCHEMA_VERSION
-            && schemaVersion != WorldmindGlobalConfiguration.V2_SCHEMA_VERSION) {
+            && schemaVersion != WorldmindGlobalConfiguration.V2_SCHEMA_VERSION && schemaVersion != WorldmindGlobalConfiguration.V3_SCHEMA_VERSION) {
             diagnostic(
                 diagnostics,
                 "global.schemaVersion",
-                "must be exactly supported schema version 1 or 2"
+                "must be exactly supported schema version 1, 2, or 3"
                     + "; found " + schemaVersion + "."
             );
         }
-        if (schemaVersion != null) rejectUnknownFields(global, "global",
-            schemaVersion == WorldmindGlobalConfiguration.V1_SCHEMA_VERSION ? GLOBAL_FIELDS_V1 : GLOBAL_FIELDS_V2, diagnostics);
+        if (schemaVersion != null) rejectUnknownFields(global, "global", schemaVersion == WorldmindGlobalConfiguration.V1_SCHEMA_VERSION
+            ? GLOBAL_FIELDS_V1 : schemaVersion == WorldmindGlobalConfiguration.V2_SCHEMA_VERSION ? GLOBAL_FIELDS_V2 : GLOBAL_FIELDS_V3, diagnostics);
         Boolean enabled = requiredBoolean(global, "enabled", "global", diagnostics);
         String activeProfile = requiredString(global, "activeProfile", "global", diagnostics);
         JsonObject chatBatching = requiredObject(global, "chatBatching", "global", diagnostics);
@@ -331,11 +352,9 @@ public final class WorldmindStartupConfigurationLoader {
         }
         rejectUnknownFields(provider, "global.provider", PROVIDER_FIELDS, diagnostics);
         String providerId = requiredString(provider, "id", "global.provider", diagnostics);
-        String endpointValue = requiredString(provider, "endpoint", "global.provider", diagnostics);
+        Optional<ProviderEndpoint> endpoint = optionalProviderEndpoint(provider, diagnostics);
         String model = requiredString(provider, "model", "global.provider", diagnostics);
         String secretReference = requiredString(provider, "secretReference", "global.provider", diagnostics);
-        ProviderEndpoint endpoint = endpointValue == null ? null : parseProviderEndpoint(endpointValue, diagnostics);
-        validateProviderId(providerId, diagnostics);
         validateSecretReference(secretReference, diagnostics);
 
         JsonObject timeouts = requiredObject(provider, "timeouts", "global.provider", diagnostics);
@@ -359,9 +378,10 @@ public final class WorldmindStartupConfigurationLoader {
             diagnostics
         );
         validateGenerationParameters(temperature, topP, maxOutputTokens, diagnostics);
+        validateProviderPreset(providerId, endpoint, model, temperature, topP, maxOutputTokens, diagnostics);
 
         if (schemaVersion == null || enabled == null || activeProfile == null || batchingConfiguration == null || requestQueueConfiguration == null
-            || providerId == null || endpoint == null || model == null || secretReference == null || timeoutConfiguration == null || retryConfiguration == null || circuitBreakerConfiguration == null || dialogueRetention == null) {
+            || providerId == null || model == null || secretReference == null || timeoutConfiguration == null || retryConfiguration == null || circuitBreakerConfiguration == null || dialogueRetention == null) {
             return null;
         }
         return new ParsedGlobal(
@@ -531,13 +551,39 @@ public final class WorldmindStartupConfigurationLoader {
         return null;
     }
 
-    private void validateProviderId(String providerId, List<ConfigurationDiagnostic> diagnostics) {
-        if (providerId != null && !CUSTOM_OPENAI_COMPATIBLE.equals(providerId)) {
-            diagnostic(
-                diagnostics,
-                "global.provider.id",
-                "must be \"" + CUSTOM_OPENAI_COMPATIBLE + "\" in v1."
-            );
+    private Optional<ProviderEndpoint> optionalProviderEndpoint(JsonObject provider, List<ConfigurationDiagnostic> diagnostics) {
+        if (!provider.has("endpoint")) return Optional.empty();
+        JsonElement endpointValue = provider.get("endpoint");
+        if (!isString(endpointValue) || endpointValue.getAsString().isBlank()) {
+            diagnostic(diagnostics, "global.provider.endpoint", "must be a non-blank endpoint URI when supplied.");
+            return Optional.empty();
+        }
+        ProviderEndpoint endpoint = parseProviderEndpoint(endpointValue.getAsString(), diagnostics);
+        return Optional.ofNullable(endpoint);
+    }
+
+    private void validateProviderPreset(
+        String providerId,
+        Optional<ProviderEndpoint> endpoint,
+        String model,
+        Optional<Double> temperature,
+        Optional<Double> topP,
+        Optional<Integer> maxOutputTokens,
+        List<ConfigurationDiagnostic> diagnostics
+    ) {
+        if (providerId == null || model == null) return;
+        GenerationParameters generation;
+        try { generation = new GenerationParameters(temperature, topP, maxOutputTokens); }
+        catch (IllegalArgumentException invalid) { return; }
+        BuiltInProviderPresetRegistry.ProviderPresetValidation result = providerPresets.validate(providerId, endpoint, model, generation);
+        if (result.kind() == BuiltInProviderPresetRegistry.ProviderPresetValidation.Kind.UNKNOWN) {
+            diagnostic(diagnostics, ConfigurationDiagnosticCode.UNKNOWN_PROVIDER_PRESET, "global.provider.id", "must name a supported built-in provider preset.");
+        } else if (result.kind() == BuiltInProviderPresetRegistry.ProviderPresetValidation.Kind.INVALID) {
+            String reason = result.reason().orElse("provider preset configuration is invalid.");
+            ConfigurationDiagnosticCode code = reason.contains("model") || reason.contains("maxOutputTokens")
+                ? ConfigurationDiagnosticCode.INCOMPATIBLE_MODEL_OR_PARAMETER : ConfigurationDiagnosticCode.INVALID_PRESET_CONFIGURATION;
+            String field = reason.contains("endpoint") ? "global.provider.endpoint" : "global.provider";
+            diagnostic(diagnostics, code, field, reason);
         }
     }
 
@@ -932,6 +978,10 @@ public final class WorldmindStartupConfigurationLoader {
         return element != null && element.isJsonPrimitive() && element.getAsJsonPrimitive().isString();
     }
 
+    private String stringValue(JsonElement element) {
+        return isString(element) ? element.getAsString() : null;
+    }
+
     private boolean isNumber(JsonElement element) {
         return element != null && element.isJsonPrimitive() && element.getAsJsonPrimitive().isNumber();
     }
@@ -947,12 +997,16 @@ public final class WorldmindStartupConfigurationLoader {
         diagnostics.add(new ConfigurationDiagnostic(field, reason));
     }
 
+    private void diagnostic(List<ConfigurationDiagnostic> diagnostics, ConfigurationDiagnosticCode code, String field, String reason) {
+        diagnostics.add(new ConfigurationDiagnostic(code, field, reason));
+    }
+
     private record ParsedGlobal(
         int schemaVersion,
         boolean enabled,
         String activeProfile,
         String providerId,
-        ProviderEndpoint endpoint,
+        Optional<ProviderEndpoint> endpoint,
         String model,
         Optional<Double> temperature,
         Optional<Double> topP,
