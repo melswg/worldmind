@@ -93,6 +93,7 @@ class WorldmindFabricServerLifecycleTest {
                 "model": "example-model",
                 "secretReference": "env:WORLDMIND_TEST_KEY",
                 "timeouts": {"connectMillis": 5000, "responseCompletionMillis": 30000},
+                "retry": {"maximumAttempts": 3, "initialBackoffMillis": 250, "maximumBackoffMillis": 4000, "jitterRatio": 0.2},
                 "generation": {}
               }
             }

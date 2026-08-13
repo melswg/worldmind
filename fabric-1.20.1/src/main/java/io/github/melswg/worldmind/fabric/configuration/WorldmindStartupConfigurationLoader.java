@@ -17,6 +17,7 @@ import io.github.melswg.worldmind.core.configuration.LoreMaterial;
 import io.github.melswg.worldmind.core.configuration.ProviderConfiguration;
 import io.github.melswg.worldmind.core.configuration.ProviderEndpoint;
 import io.github.melswg.worldmind.core.configuration.ProviderTimeoutConfiguration;
+import io.github.melswg.worldmind.core.configuration.ProviderRetryConfiguration;
 import io.github.melswg.worldmind.core.configuration.RequestQueueConfiguration;
 import io.github.melswg.worldmind.core.configuration.ResponseLengthLimit;
 import io.github.melswg.worldmind.core.configuration.SecretAvailability;
@@ -67,9 +68,10 @@ public final class WorldmindStartupConfigurationLoader {
         "maxEstimatedInputCharacters"
     );
     private static final Set<String> REQUEST_QUEUE_FIELDS = Set.of("capacity", "maxConcurrency");
-    private static final Set<String> PROVIDER_FIELDS = Set.of("id", "endpoint", "model", "generation", "secretReference", "timeouts");
+    private static final Set<String> PROVIDER_FIELDS = Set.of("id", "endpoint", "model", "generation", "secretReference", "timeouts", "retry");
     private static final Set<String> GENERATION_FIELDS = Set.of("temperature", "topP", "maxOutputTokens");
     private static final Set<String> TIMEOUT_FIELDS = Set.of("connectMillis", "responseCompletionMillis");
+    private static final Set<String> RETRY_FIELDS = Set.of("maximumAttempts", "initialBackoffMillis", "maximumBackoffMillis", "jitterRatio");
     private static final Set<String> PROFILE_FIELDS = Set.of(
         "schemaVersion",
         "characterName",
@@ -119,7 +121,8 @@ public final class WorldmindStartupConfigurationLoader {
                 global.model(),
                 new GenerationParameters(global.temperature(), global.topP(), global.maxOutputTokens()),
                 new ExternalSecretReference(global.secretReference()),
-                global.timeouts()
+                global.timeouts(),
+                global.retry()
             ),
             global.chatBatching(),
             global.requestQueue()
@@ -206,6 +209,8 @@ public final class WorldmindStartupConfigurationLoader {
 
         JsonObject timeouts = requiredObject(provider, "timeouts", "global.provider", diagnostics);
         ProviderTimeoutConfiguration timeoutConfiguration = parseTimeouts(timeouts, diagnostics);
+        JsonObject retry = requiredObject(provider, "retry", "global.provider", diagnostics);
+        ProviderRetryConfiguration retryConfiguration = parseRetry(retry, diagnostics);
 
         JsonObject generation = requiredObject(provider, "generation", "global.provider", diagnostics);
         if (generation == null) {
@@ -223,7 +228,7 @@ public final class WorldmindStartupConfigurationLoader {
         validateGenerationParameters(temperature, topP, maxOutputTokens, diagnostics);
 
         if (schemaVersion == null || enabled == null || activeProfile == null || batchingConfiguration == null || requestQueueConfiguration == null
-            || providerId == null || endpoint == null || model == null || secretReference == null || timeoutConfiguration == null) {
+            || providerId == null || endpoint == null || model == null || secretReference == null || timeoutConfiguration == null || retryConfiguration == null) {
             return null;
         }
         return new ParsedGlobal(
@@ -238,9 +243,26 @@ public final class WorldmindStartupConfigurationLoader {
             maxOutputTokens,
             secretReference,
             timeoutConfiguration,
+            retryConfiguration,
             batchingConfiguration,
             requestQueueConfiguration
         );
+    }
+
+    private ProviderRetryConfiguration parseRetry(JsonObject retry, List<ConfigurationDiagnostic> diagnostics) {
+        if (retry == null) return null;
+        rejectUnknownFields(retry, "global.provider.retry", RETRY_FIELDS, diagnostics);
+        Integer attempts = requiredInteger(retry, "maximumAttempts", "global.provider.retry", diagnostics);
+        Integer initial = requiredInteger(retry, "initialBackoffMillis", "global.provider.retry", diagnostics);
+        Integer maximum = requiredInteger(retry, "maximumBackoffMillis", "global.provider.retry", diagnostics);
+        Optional<Double> jitter = optionalDouble(retry, "jitterRatio", "global.provider.retry", diagnostics);
+        if (attempts == null || initial == null || maximum == null || jitter.isEmpty()) return null;
+        try {
+            return new ProviderRetryConfiguration(attempts, initial, maximum, jitter.orElseThrow());
+        } catch (IllegalArgumentException invalid) {
+            diagnostic(diagnostics, "global.provider.retry", "must use bounded attempts, backoff, and jitter values.");
+            return null;
+        }
     }
 
     private ProviderTimeoutConfiguration parseTimeouts(JsonObject timeouts, List<ConfigurationDiagnostic> diagnostics) {
@@ -772,6 +794,7 @@ public final class WorldmindStartupConfigurationLoader {
         Optional<Integer> maxOutputTokens,
         String secretReference,
         ProviderTimeoutConfiguration timeouts,
+        ProviderRetryConfiguration retry,
         ChatBatchingConfiguration chatBatching,
         RequestQueueConfiguration requestQueue
     ) {
