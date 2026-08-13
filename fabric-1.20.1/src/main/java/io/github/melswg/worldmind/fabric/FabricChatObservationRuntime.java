@@ -1,10 +1,16 @@
 package io.github.melswg.worldmind.fabric;
 
 import io.github.melswg.worldmind.core.configuration.ValidatedWorldmindConfiguration;
+import io.github.melswg.worldmind.core.conversation.AsyncWorkKind;
+import io.github.melswg.worldmind.core.conversation.AsyncWorkRejectedException;
+import io.github.melswg.worldmind.core.conversation.AsyncWorkRejection;
+import io.github.melswg.worldmind.core.conversation.AsyncWorkSubmission;
+import io.github.melswg.worldmind.core.conversation.BoundedAsyncWorkCoordinator;
 import io.github.melswg.worldmind.core.conversation.CapturedPublicChatMessage;
 import io.github.melswg.worldmind.core.conversation.ChatBatchAdmission;
 import io.github.melswg.worldmind.core.conversation.ChatBatchCoordinator;
 import io.github.melswg.worldmind.core.conversation.ConversationApplicationService;
+import io.github.melswg.worldmind.core.conversation.ConversationExecution;
 import io.github.melswg.worldmind.core.conversation.ConversationOutcome;
 import io.github.melswg.worldmind.core.conversation.ConversationRefusal;
 import io.github.melswg.worldmind.core.conversation.DelayedScheduler;
@@ -13,6 +19,7 @@ import io.github.melswg.worldmind.core.conversation.NormalizedServerRequest;
 import io.github.melswg.worldmind.core.conversation.ProviderCapabilities;
 import io.github.melswg.worldmind.core.conversation.RefusalCode;
 import io.github.melswg.worldmind.core.conversation.ServerRequester;
+import io.github.melswg.worldmind.core.conversation.SealedChatBatch;
 import io.github.melswg.worldmind.core.conversation.UntrustedContext;
 import io.github.melswg.worldmind.core.conversation.WorldIdentity;
 import io.github.melswg.worldmind.core.journal.DialogueJournal;
@@ -30,7 +37,9 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.network.message.SignedMessage;
 import net.minecraft.server.MinecraftServer;
@@ -53,10 +62,12 @@ final class FabricChatObservationRuntime implements AutoCloseable {
     private final Clock clock;
     private final ConversationApplicationService applicationService;
     private final MemoryCompactionService compactionService;
+    private final BoundedAsyncWorkCoordinator workCoordinator;
     private final ProviderCapabilities providerCapabilities;
     private final FabricChatDiagnostics diagnostics;
     private final FabricChatOutcomeRouter outcomeRouter;
     private final ChatBatchCoordinator batchCoordinator;
+    private final Set<CompletableFuture<Void>> pendingAuditWrites = ConcurrentHashMap.newKeySet();
 
     static FabricChatObservationRuntime createProduction(
         MinecraftServer server,
@@ -123,6 +134,7 @@ final class FabricChatObservationRuntime implements AutoCloseable {
         this.compactionService = journal instanceof MemoryCompactionRepository repository
             ? new MemoryCompactionService(repository, new DeterministicMemoryCompactionGenerator())
             : null;
+        this.workCoordinator = new BoundedAsyncWorkCoordinator(validated.globalConfiguration().requestQueue());
         this.providerCapabilities = Objects.requireNonNull(providerCapabilities, "providerCapabilities");
         this.outcomeRouter = new FabricChatOutcomeRouter(
             ownedWorld,
@@ -182,7 +194,12 @@ final class FabricChatObservationRuntime implements AutoCloseable {
                 return;
             }
             try {
-                batchCoordinator.observe(observation.toObservedPublicChatMessage(captured.currentContext()), worldIdentity);
+                io.github.melswg.worldmind.core.conversation.ObservedPublicChatMessage observed =
+                    observation.toObservedPublicChatMessage(captured.currentContext());
+                ChatBatchAdmission admission = batchCoordinator.observe(observed, worldIdentity);
+                if (admission == ChatBatchAdmission.REJECTED_CAPACITY) {
+                    recordBatchingOverflow(observed);
+                }
             } catch (RuntimeException ignored) {
                 outcomeRouter.notifyStorageUnavailable(captured);
             }
@@ -196,9 +213,10 @@ final class FabricChatObservationRuntime implements AutoCloseable {
             return;
         }
         batchCoordinator.close();
+        CompletionStage<Void> workStopped = workCoordinator.closeAsync();
         closeQuietly(delayedSchedulerCloser);
         closeQuietly(serverSchedulerCloser);
-        journal.closeAsync();
+        workStopped.thenCompose(ignored -> awaitAuditWrites()).whenComplete((ignored, failure) -> journal.closeAsync());
     }
 
     private CompletionStage<?> decideAndDeliver(io.github.melswg.worldmind.core.conversation.SealedChatBatch batch) {
@@ -214,46 +232,167 @@ final class FabricChatObservationRuntime implements AutoCloseable {
                 });
                 return;
             }
+            ConversationWorkState workState = new ConversationWorkState();
+            AsyncWorkSubmission<Void> submission;
             try {
-                applicationService.handle(new NormalizedServerRequest(batch, configuration, providerCapabilities))
-                    .whenComplete((outcome, failure) -> serverScheduler.execute(() ->
-                        finishJournaledBatch(batch, journaledBatch, outcome, failure, completed)
-                    ));
+                submission = workCoordinator.submit(
+                    ownedWorld,
+                    journaledBatch.firstSequence(),
+                    AsyncWorkKind.CONVERSATION,
+                    () -> processJournaledBatch(batch, journaledBatch, workState)
+                );
             } catch (RuntimeException failure) {
-                serverScheduler.execute(() -> finishJournaledBatch(batch, journaledBatch, null, failure, completed));
+                recordQueueRejection(batch, journaledBatch, AsyncWorkRejection.CLOSED).whenComplete((ignored, auditFailure) -> completed.complete(null));
+                return;
             }
+            if (!submission.accepted()) {
+                recordQueueRejection(batch, journaledBatch, submission.rejection().orElseThrow())
+                    .whenComplete((ignored, auditFailure) -> completed.complete(null));
+                return;
+            }
+            submission.completion().whenComplete((ignored, failure) -> {
+                if (failure instanceof AsyncWorkRejectedException rejected) {
+                    recordQueueRejection(batch, journaledBatch, rejected.rejection())
+                        .whenComplete((ignoredAudit, auditFailure) -> completed.complete(null));
+                } else if (failure != null && workState.claimTerminalAudit()) {
+                    recordCancelledActiveWork(batch, journaledBatch, workState)
+                        .whenComplete((ignoredAudit, auditFailure) -> completed.complete(null));
+                } else {
+                    completed.complete(null);
+                }
+            });
         });
         return completed;
     }
 
-    private void finishJournaledBatch(
+    private CompletionStage<Void> processJournaledBatch(
         io.github.melswg.worldmind.core.conversation.SealedChatBatch batch,
         JournaledBatch journaledBatch,
-        ConversationOutcome outcome,
-        Throwable failure,
-        CompletableFuture<Void> completed
+        ConversationWorkState workState
     ) {
-        if (!active.get()) {
-            completed.complete(null);
-            return;
+        CompletionStage<ConversationExecution> outcomes;
+        try {
+            outcomes = applicationService.handleTracked(new NormalizedServerRequest(batch, configuration, providerCapabilities));
+            if (outcomes == null) outcomes = CompletableFuture.failedFuture(new IllegalStateException("Conversation service returned no stage."));
+        } catch (RuntimeException failure) {
+            outcomes = CompletableFuture.failedFuture(failure);
         }
-        ConversationOutcome resolved = failure == null && outcome != null
-            ? outcome
-            : new ConversationRefusal(RefusalCode.PROVIDER_UNAVAILABLE);
-        JournalDeliveryReport delivery = outcomeRouter.deliver(batch, resolved);
-        JournalBatchOutcome audit = journalOutcome(journaledBatch, resolved, delivery);
-        journal.appendOutcome(audit).whenComplete((ignored, journalFailure) -> {
-            if (journalFailure == null && compactionService != null && active.get()) {
-                compactionService.compactNext(ownedWorld).whenComplete((compacted, compactionFailure) -> {
-                    if (compactionFailure != null) {
-                        diagnostics.record(FabricChatDeliveryDiagnostic.delivery(
-                            FabricChatDeliveryDiagnosticKind.COMPACTION_FAILED,
-                            journaledBatch.firstSequence(), journaledBatch.lastSequence()
-                        ));
-                    }
-                });
+        return outcomes.handle((execution, failure) -> {
+            ConversationExecution resolved = failure == null && execution != null
+                ? execution
+                : new ConversationExecution(new ConversationRefusal(RefusalCode.PROVIDER_UNAVAILABLE), workState.providerAttempted.get());
+            workState.providerAttempted.set(resolved.providerAttempted());
+            return resolved;
+        }).thenCompose(resolved -> recordResolvedOutcome(batch, journaledBatch, resolved.outcome(), workState));
+    }
+
+    private CompletionStage<Void> recordResolvedOutcome(
+        io.github.melswg.worldmind.core.conversation.SealedChatBatch batch,
+        JournaledBatch journaledBatch,
+        ConversationOutcome resolved,
+        ConversationWorkState workState
+    ) {
+        CompletableFuture<Void> completed = new CompletableFuture<>();
+        Runnable deliverAndPersist = () -> {
+            if (!workState.claimTerminalAudit()) {
+                completed.complete(null);
+                return;
             }
-            completed.complete(null);
+            JournalDeliveryReport delivery = outcomeRouter.deliver(batch, resolved);
+            JournalBatchOutcome audit = journalOutcome(journaledBatch, resolved, delivery);
+            appendTrackedOutcome(audit).whenComplete((ignored, journalFailure) -> {
+                if (journalFailure == null) startCompaction(journaledBatch);
+                completed.complete(null);
+            });
+        };
+        if (active.get()) serverScheduler.execute(deliverAndPersist); else deliverAndPersist.run();
+        return completed;
+    }
+
+    private CompletionStage<Void> recordQueueRejection(
+        SealedChatBatch batch,
+        JournaledBatch journaledBatch,
+        AsyncWorkRejection rejection
+    ) {
+        CompletableFuture<Void> completed = new CompletableFuture<>();
+        Runnable deliverAndPersist = () -> {
+            JournalDeliveryReport delivery = outcomeRouter.deliver(batch, new ConversationRefusal(RefusalCode.REQUEST_QUEUE_UNAVAILABLE));
+            JournalBatchOutcome audit = new JournalBatchOutcome(
+                journaledBatch.batchId(), ProviderAttemptOutcome.NOT_ATTEMPTED, java.util.Optional.empty(),
+                java.util.Optional.of(RefusalCode.REQUEST_QUEUE_UNAVAILABLE), delivery, clock.instant()
+            );
+            appendTrackedOutcome(audit).whenComplete((ignored, failure) -> completed.complete(null));
+        };
+        diagnostics.record(FabricChatDeliveryDiagnostic.queueRejection(
+            AsyncWorkKind.CONVERSATION,
+            ownedWorld,
+            journaledBatch.firstSequence(),
+            journaledBatch.lastSequence(),
+            workCoordinator.snapshot()
+        ));
+        if (active.get()) serverScheduler.execute(deliverAndPersist); else deliverAndPersist.run();
+        return completed;
+    }
+
+    private CompletionStage<Void> recordCancelledActiveWork(
+        SealedChatBatch batch,
+        JournaledBatch journaledBatch,
+        ConversationWorkState workState
+    ) {
+        JournalDeliveryReport delivery = outcomeRouter.deliver(batch, new ConversationRefusal(RefusalCode.REQUEST_QUEUE_UNAVAILABLE));
+        JournalBatchOutcome audit = new JournalBatchOutcome(
+            journaledBatch.batchId(),
+            workState.providerAttempted.get() ? ProviderAttemptOutcome.FAILED : ProviderAttemptOutcome.NOT_ATTEMPTED,
+            java.util.Optional.empty(),
+            java.util.Optional.of(RefusalCode.REQUEST_QUEUE_UNAVAILABLE),
+            delivery,
+            clock.instant()
+        );
+        return appendTrackedOutcome(audit);
+    }
+
+    private void recordBatchingOverflow(io.github.melswg.worldmind.core.conversation.ObservedPublicChatMessage observed) {
+        SealedChatBatch overflow = new SealedChatBatch(
+            ownedWorld,
+            List.of(observed),
+            io.github.melswg.worldmind.core.conversation.ChatBatchSealReason.BATCHING_CAPACITY_OVERFLOW,
+            observed.currentContext()
+        );
+        journal.appendBatch(overflow).whenComplete((journaledBatch, failure) -> {
+            if (failure == null && journaledBatch != null) {
+                recordQueueRejection(overflow, journaledBatch, AsyncWorkRejection.CAPACITY);
+            } else if (active.get() && observed.addressingSignal() == io.github.melswg.worldmind.core.conversation.AddressingSignal.EXACT) {
+                outcomeRouter.deliver(overflow, new ConversationRefusal(RefusalCode.JOURNAL_UNAVAILABLE));
+            }
+        });
+    }
+
+    private CompletionStage<Void> appendTrackedOutcome(JournalBatchOutcome audit) {
+        CompletableFuture<Void> completed = new CompletableFuture<>();
+        pendingAuditWrites.add(completed);
+        completed.whenComplete((ignored, failure) -> pendingAuditWrites.remove(completed));
+        journal.appendOutcome(audit).whenComplete((ignored, failure) -> completed.complete(null));
+        return completed;
+    }
+
+    @SuppressWarnings("unchecked")
+    private CompletionStage<Void> awaitAuditWrites() {
+        CompletableFuture<Void>[] snapshot = pendingAuditWrites.toArray(new CompletableFuture[0]);
+        return snapshot.length == 0 ? CompletableFuture.completedFuture(null) : CompletableFuture.allOf(snapshot);
+    }
+
+    private void startCompaction(JournaledBatch journaledBatch) {
+        if (compactionService == null || !active.get()) return;
+        AsyncWorkSubmission<Void> submission = workCoordinator.submit(
+            ownedWorld, journaledBatch.lastSequence(), AsyncWorkKind.COMPACTION, () -> compactionService.compactNext(ownedWorld)
+        );
+        if (!submission.accepted()) return;
+        submission.completion().whenComplete((ignored, failure) -> {
+            if (failure != null && active.get()) {
+                diagnostics.record(FabricChatDeliveryDiagnostic.delivery(
+                    FabricChatDeliveryDiagnosticKind.COMPACTION_FAILED, journaledBatch.firstSequence(), journaledBatch.lastSequence()
+                ));
+            }
         });
     }
 
@@ -276,7 +415,7 @@ final class FabricChatObservationRuntime implements AutoCloseable {
         }
         ConversationRefusal refusal = (ConversationRefusal) outcome;
         ProviderAttemptOutcome providerResult = switch (refusal.code()) {
-            case PROVIDER_INCOMPATIBLE, PROMPT_BUDGET_EXCEEDED, MEMORY_UNAVAILABLE -> ProviderAttemptOutcome.NOT_ATTEMPTED;
+            case PROVIDER_INCOMPATIBLE, PROMPT_BUDGET_EXCEEDED, MEMORY_UNAVAILABLE, REQUEST_QUEUE_UNAVAILABLE -> ProviderAttemptOutcome.NOT_ATTEMPTED;
             default -> ProviderAttemptOutcome.FAILED;
         };
         return new JournalBatchOutcome(batch.batchId(), providerResult,
@@ -299,6 +438,15 @@ final class FabricChatObservationRuntime implements AutoCloseable {
             closeable.close();
         } catch (Exception ignored) {
             // Closing one local resource must not retain server state or stop Minecraft.
+        }
+    }
+
+    private static final class ConversationWorkState {
+        private final AtomicBoolean providerAttempted = new AtomicBoolean();
+        private final AtomicBoolean terminalAuditClaimed = new AtomicBoolean();
+
+        private boolean claimTerminalAudit() {
+            return terminalAuditClaimed.compareAndSet(false, true);
         }
     }
 }

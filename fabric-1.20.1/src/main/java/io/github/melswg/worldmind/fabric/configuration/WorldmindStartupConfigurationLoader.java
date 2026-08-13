@@ -16,6 +16,7 @@ import io.github.melswg.worldmind.core.configuration.IntegrationDisableReason;
 import io.github.melswg.worldmind.core.configuration.LoreMaterial;
 import io.github.melswg.worldmind.core.configuration.ProviderConfiguration;
 import io.github.melswg.worldmind.core.configuration.ProviderEndpoint;
+import io.github.melswg.worldmind.core.configuration.RequestQueueConfiguration;
 import io.github.melswg.worldmind.core.configuration.ResponseLengthLimit;
 import io.github.melswg.worldmind.core.configuration.SecretAvailability;
 import io.github.melswg.worldmind.core.configuration.SecretResolver;
@@ -56,13 +57,15 @@ public final class WorldmindStartupConfigurationLoader {
         "enabled",
         "activeProfile",
         "provider",
-        "chatBatching"
+        "chatBatching",
+        "requestQueue"
     );
     private static final Set<String> CHAT_BATCHING_FIELDS = Set.of(
         "maxMessages",
         "maxWaitMillis",
         "maxEstimatedInputCharacters"
     );
+    private static final Set<String> REQUEST_QUEUE_FIELDS = Set.of("capacity", "maxConcurrency");
     private static final Set<String> PROVIDER_FIELDS = Set.of("id", "endpoint", "model", "generation", "secretReference");
     private static final Set<String> GENERATION_FIELDS = Set.of("temperature", "topP", "maxOutputTokens");
     private static final Set<String> PROFILE_FIELDS = Set.of(
@@ -115,7 +118,8 @@ public final class WorldmindStartupConfigurationLoader {
                 new GenerationParameters(global.temperature(), global.topP(), global.maxOutputTokens()),
                 new ExternalSecretReference(global.secretReference())
             ),
-            global.chatBatching()
+            global.chatBatching(),
+            global.requestQueue()
         );
         WorldmindProfile worldmindProfile = new WorldmindProfile(
             profile.schemaVersion(),
@@ -181,6 +185,8 @@ public final class WorldmindStartupConfigurationLoader {
         String activeProfile = requiredString(global, "activeProfile", "global", diagnostics);
         JsonObject chatBatching = requiredObject(global, "chatBatching", "global", diagnostics);
         ChatBatchingConfiguration batchingConfiguration = parseChatBatching(chatBatching, diagnostics);
+        JsonObject requestQueue = requiredObject(global, "requestQueue", "global", diagnostics);
+        RequestQueueConfiguration requestQueueConfiguration = parseRequestQueue(requestQueue, diagnostics);
 
         JsonObject provider = requiredObject(global, "provider", "global", diagnostics);
         if (provider == null) {
@@ -210,7 +216,7 @@ public final class WorldmindStartupConfigurationLoader {
         );
         validateGenerationParameters(temperature, topP, maxOutputTokens, diagnostics);
 
-        if (schemaVersion == null || enabled == null || activeProfile == null || batchingConfiguration == null
+        if (schemaVersion == null || enabled == null || activeProfile == null || batchingConfiguration == null || requestQueueConfiguration == null
             || providerId == null || endpoint == null || model == null || secretReference == null) {
             return null;
         }
@@ -225,8 +231,20 @@ public final class WorldmindStartupConfigurationLoader {
             topP,
             maxOutputTokens,
             secretReference,
-            batchingConfiguration
+            batchingConfiguration,
+            requestQueueConfiguration
         );
+    }
+
+    private RequestQueueConfiguration parseRequestQueue(JsonObject requestQueue, List<ConfigurationDiagnostic> diagnostics) {
+        if (requestQueue == null) return null;
+        rejectUnknownFields(requestQueue, "global.requestQueue", REQUEST_QUEUE_FIELDS, diagnostics);
+        Integer capacity = requiredInteger(requestQueue, "capacity", "global.requestQueue", diagnostics);
+        Integer maxConcurrency = requiredInteger(requestQueue, "maxConcurrency", "global.requestQueue", diagnostics);
+        validatePositiveBatchingValue(capacity, "global.requestQueue.capacity", diagnostics);
+        validatePositiveBatchingValue(maxConcurrency, "global.requestQueue.maxConcurrency", diagnostics);
+        if (capacity == null || maxConcurrency == null || capacity <= 0 || maxConcurrency <= 0) return null;
+        return new RequestQueueConfiguration(capacity, maxConcurrency);
     }
 
     private ChatBatchingConfiguration parseChatBatching(
@@ -732,7 +750,8 @@ public final class WorldmindStartupConfigurationLoader {
         Optional<Double> topP,
         Optional<Integer> maxOutputTokens,
         String secretReference,
-        ChatBatchingConfiguration chatBatching
+        ChatBatchingConfiguration chatBatching,
+        RequestQueueConfiguration requestQueue
     ) {
     }
 

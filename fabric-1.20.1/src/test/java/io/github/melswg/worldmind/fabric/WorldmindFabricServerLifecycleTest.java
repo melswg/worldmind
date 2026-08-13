@@ -86,6 +86,7 @@ class WorldmindFabricServerLifecycleTest {
                 "maxWaitMillis": 5000,
                 "maxEstimatedInputCharacters": 4000
               },
+              "requestQueue": {"capacity": 16, "maxConcurrency": 2},
               "provider": {
                 "id": "custom-openai-compatible",
                 "endpoint": "https://api.example.invalid/v1/chat/completions",

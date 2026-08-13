@@ -57,6 +57,8 @@ class WorldmindStartupConfigurationLoaderTest {
         assertEquals(8, ranger.configuration().globalConfiguration().chatBatching().maxMessages());
         assertEquals(5_000, ranger.configuration().globalConfiguration().chatBatching().maxWaitMillis());
         assertEquals(4_000, ranger.configuration().globalConfiguration().chatBatching().maxEstimatedInputCharacters());
+        assertEquals(16, ranger.configuration().globalConfiguration().requestQueue().capacity());
+        assertEquals(2, ranger.configuration().globalConfiguration().requestQueue().maxConcurrency());
         assertEquals(
             "https://api.example.invalid/v1/chat/completions",
             ranger.configuration().globalConfiguration().provider().endpoint().uri().toString()
@@ -125,6 +127,7 @@ class WorldmindStartupConfigurationLoaderTest {
               "enabled": true,
               "activeProfile": "oracle",
               "chatBatching": {"maxMessages": 8, "maxWaitMillis": 5000, "maxEstimatedInputCharacters": 4000},
+              "requestQueue": {"capacity": 16, "maxConcurrency": 2},
               "unsupportedFutureField": true,
               "provider": {
                 "id": "custom-openai-compatible",
@@ -196,6 +199,46 @@ class WorldmindStartupConfigurationLoaderTest {
         );
 
         assertDiagnostic(disabled.diagnostics(), "global.chatBatching", "is required");
+    }
+
+    @Test
+    void requiresStrictPositiveRequestQueueFieldsBeforeStartingTheIntegration() throws IOException {
+        writeProfile("oracle", "Aster", "Measured and curious.", "Never claim server authority.", "Speak calmly.", 280);
+        writeGlobal(true, "oracle", "{}", "env:WORLDMIND_TEST_KEY");
+        Path globalFile = configurationDirectory.resolve("worldmind.json");
+        String invalid = Files.readString(globalFile, StandardCharsets.UTF_8)
+            .replace("\"capacity\": 16", "\"capacity\": 0")
+            .replace("\"maxConcurrency\": 2", "\"maxConcurrency\": \"many\", \"unknown\": true");
+        Files.writeString(globalFile, invalid, StandardCharsets.UTF_8);
+
+        DisabledWorldmindIntegration disabled = assertInstanceOf(
+            DisabledWorldmindIntegration.class,
+            new WorldmindStartupConfigurationLoader(configurationDirectory, WorldmindTestkit.secretResolver()).load()
+        );
+
+        assertDiagnostic(disabled.diagnostics(), "global.requestQueue.capacity", "positive");
+        assertDiagnostic(disabled.diagnostics(), "global.requestQueue.maxConcurrency", "integer");
+        assertDiagnostic(disabled.diagnostics(), "global.requestQueue.unknown", "not supported by the strict v1 schema");
+        assertEquals(invalid, Files.readString(globalFile, StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void reportsMissingRequestQueueAsAFieldLevelStartupDiagnostic() throws IOException {
+        writeProfile("oracle", "Aster", "Measured and curious.", "Never claim server authority.", "Speak calmly.", 280);
+        writeGlobal(true, "oracle", "{}", "env:WORLDMIND_TEST_KEY");
+        Path globalFile = configurationDirectory.resolve("worldmind.json");
+        String missing = Files.readString(globalFile, StandardCharsets.UTF_8).replaceAll(
+            "(?s)\\s*\\\"requestQueue\\\": \\{.*?\\},(?=\\s*\\\"provider\\\")",
+            ""
+        );
+        Files.writeString(globalFile, missing, StandardCharsets.UTF_8);
+
+        DisabledWorldmindIntegration disabled = assertInstanceOf(
+            DisabledWorldmindIntegration.class,
+            new WorldmindStartupConfigurationLoader(configurationDirectory, WorldmindTestkit.secretResolver()).load()
+        );
+
+        assertDiagnostic(disabled.diagnostics(), "global.requestQueue", "is required");
     }
 
     @Test
@@ -416,6 +459,7 @@ class WorldmindStartupConfigurationLoaderTest {
                 "maxWaitMillis": 5000,
                 "maxEstimatedInputCharacters": 4000
               },
+              "requestQueue": {"capacity": 16, "maxConcurrency": 2},
               "provider": {
                 "id": "%s",
                 "endpoint": "%s",

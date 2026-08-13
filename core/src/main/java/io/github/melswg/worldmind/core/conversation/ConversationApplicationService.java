@@ -35,10 +35,18 @@ public final class ConversationApplicationService {
     }
 
     public CompletionStage<ConversationOutcome> handle(NormalizedServerRequest request) {
+        return handleTracked(request).thenApply(ConversationExecution::outcome);
+    }
+
+    /**
+     * Runs the same conversation path while retaining the auditable fact of
+     * whether the language-model boundary was reached.
+     */
+    public CompletionStage<ConversationExecution> handleTracked(NormalizedServerRequest request) {
         Objects.requireNonNull(request, "request");
 
         if (!request.providerCapabilities().supportsSystemInstructions()) {
-            return scheduled(new ConversationRefusal(RefusalCode.PROVIDER_INCOMPATIBLE));
+            return scheduled(new ConversationExecution(new ConversationRefusal(RefusalCode.PROVIDER_INCOMPATIBLE), false));
         }
         if (memoryRepository == WorldMemoryRepository.empty()) {
             return handleWithMemory(request, RetrievedMemoryContext.empty());
@@ -54,18 +62,20 @@ public final class ConversationApplicationService {
             recalled = CompletableFuture.failedFuture(failure);
         }
 
-        return recalled.<CompletionStage<ConversationOutcome>>handleAsync((memory, failure) -> {
+        return recalled.<CompletionStage<ConversationExecution>>handleAsync((memory, failure) -> {
             if (failure != null || memory == null) {
-                return CompletableFuture.completedFuture(new ConversationRefusal(RefusalCode.MEMORY_UNAVAILABLE));
+                return CompletableFuture.completedFuture(
+                    new ConversationExecution(new ConversationRefusal(RefusalCode.MEMORY_UNAVAILABLE), false)
+                );
             }
             return handleWithMemory(request, memory);
         }, serverScheduler).thenCompose(stage -> stage);
     }
 
-    private CompletionStage<ConversationOutcome> handleWithMemory(NormalizedServerRequest request, RetrievedMemoryContext memory) {
+    private CompletionStage<ConversationExecution> handleWithMemory(NormalizedServerRequest request, RetrievedMemoryContext memory) {
         Optional<ProviderRequest> providerRequest = promptBuilder.build(request, memory);
         if (providerRequest.isEmpty()) {
-            return scheduled(new ConversationRefusal(RefusalCode.PROMPT_BUDGET_EXCEEDED));
+            return scheduled(new ConversationExecution(new ConversationRefusal(RefusalCode.PROMPT_BUDGET_EXCEEDED), false));
         }
 
         CompletionStage<LanguageModelResult> completion;
@@ -80,11 +90,14 @@ public final class ConversationApplicationService {
             completion = CompletableFuture.failedFuture(failure);
         }
 
-        return completion.handleAsync((result, failure) -> toOutcome(request, result, failure), serverScheduler);
+        return completion.handleAsync(
+            (result, failure) -> new ConversationExecution(toOutcome(request, result, failure), true),
+            serverScheduler
+        );
     }
 
-    private CompletionStage<ConversationOutcome> scheduled(ConversationOutcome outcome) {
-        CompletableFuture<ConversationOutcome> scheduledOutcome = new CompletableFuture<>();
+    private <T> CompletionStage<T> scheduled(T outcome) {
+        CompletableFuture<T> scheduledOutcome = new CompletableFuture<>();
         serverScheduler.execute(() -> scheduledOutcome.complete(outcome));
         return scheduledOutcome;
     }

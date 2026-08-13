@@ -208,6 +208,19 @@ final class WorldmindFabricServerLifecycle {
     }
 
     private void logDeliveryDiagnostic(FabricChatDeliveryDiagnostic diagnostic) {
+        if (diagnostic.queueSnapshot().isPresent()) {
+            var queue = diagnostic.queueSnapshot().orElseThrow();
+            LOGGER.warn(
+                "Worldmind {} work for opaque world {} at chat batch {}-{}; queued={}, active={}",
+                diagnostic.workKind().orElseThrow(),
+                diagnostic.opaqueWorldIdentity().orElseThrow(),
+                diagnostic.firstSequence(),
+                diagnostic.lastSequence(),
+                queue.queued(),
+                queue.inFlight()
+            );
+            return;
+        }
         diagnostic.refusalCode().ifPresentOrElse(
             code -> LOGGER.warn(
                 "Worldmind chat batch {}-{} ended with {}.",

@@ -11,6 +11,7 @@ import io.github.melswg.worldmind.core.configuration.GenerationParameters;
 import io.github.melswg.worldmind.core.configuration.LoreMaterial;
 import io.github.melswg.worldmind.core.configuration.ProviderConfiguration;
 import io.github.melswg.worldmind.core.configuration.ProviderEndpoint;
+import io.github.melswg.worldmind.core.configuration.RequestQueueConfiguration;
 import io.github.melswg.worldmind.core.configuration.ResponseLengthLimit;
 import io.github.melswg.worldmind.core.configuration.ValidatedWorldmindConfiguration;
 import io.github.melswg.worldmind.core.configuration.WorldmindGlobalConfiguration;
@@ -233,7 +234,8 @@ class PromptSafetyAcceptanceTest {
                     new GenerationParameters(Optional.of(0.4), Optional.empty(), Optional.of(120)),
                     new ExternalSecretReference("env:WORLDMIND_ACCEPTANCE_KEY")
                 ),
-                new ChatBatchingConfiguration(8, 5_000, 4_000)
+                new ChatBatchingConfiguration(8, 5_000, 4_000),
+                new RequestQueueConfiguration(16, 2)
             ),
             profile
         );

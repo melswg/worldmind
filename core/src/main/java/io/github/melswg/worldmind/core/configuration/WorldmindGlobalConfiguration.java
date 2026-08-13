@@ -8,7 +8,8 @@ public record WorldmindGlobalConfiguration(
     boolean enabled,
     String activeProfile,
     ProviderConfiguration provider,
-    ChatBatchingConfiguration chatBatching
+    ChatBatchingConfiguration chatBatching,
+    RequestQueueConfiguration requestQueue
 ) {
     public static final int V1_SCHEMA_VERSION = 1;
 
@@ -22,5 +23,6 @@ public record WorldmindGlobalConfiguration(
         }
         Objects.requireNonNull(provider, "provider");
         Objects.requireNonNull(chatBatching, "chatBatching");
+        Objects.requireNonNull(requestQueue, "requestQueue");
     }
 }

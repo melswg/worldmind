@@ -11,6 +11,7 @@ import io.github.melswg.worldmind.core.configuration.LoreMaterial;
 import io.github.melswg.worldmind.core.configuration.ProviderConfiguration;
 import io.github.melswg.worldmind.core.configuration.ProviderEndpoint;
 import io.github.melswg.worldmind.core.configuration.ResponseLengthLimit;
+import io.github.melswg.worldmind.core.configuration.RequestQueueConfiguration;
 import io.github.melswg.worldmind.core.configuration.SecretAvailability;
 import io.github.melswg.worldmind.core.configuration.ValidatedWorldmindConfiguration;
 import io.github.melswg.worldmind.core.configuration.WorldmindGlobalConfiguration;
@@ -246,7 +247,9 @@ class DialogueJournalAcceptanceTest {
 
     private static ValidatedWorldmindConfiguration configuration(ProviderConfiguration provider) {
         return new ValidatedWorldmindConfiguration(
-            new WorldmindGlobalConfiguration(1, true, "acceptance", provider, new ChatBatchingConfiguration(1, 5_000, 4_000)),
+            new WorldmindGlobalConfiguration(
+                1, true, "acceptance", provider, new ChatBatchingConfiguration(1, 5_000, 4_000), new RequestQueueConfiguration(16, 2)
+            ),
             new WorldmindProfile(1, "Aster", "Guide", "Be kind.",
                 List.of(new LoreMaterial("lore/acceptance.md", "The observatory watches the valley.")),
                 "brief", new ResponseLengthLimit(280))

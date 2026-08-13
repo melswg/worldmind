@@ -12,12 +12,16 @@ import io.github.melswg.worldmind.core.configuration.LoreMaterial;
 import io.github.melswg.worldmind.core.configuration.ProviderConfiguration;
 import io.github.melswg.worldmind.core.configuration.ProviderEndpoint;
 import io.github.melswg.worldmind.core.configuration.ResponseLengthLimit;
+import io.github.melswg.worldmind.core.configuration.RequestQueueConfiguration;
 import io.github.melswg.worldmind.core.configuration.ValidatedWorldmindConfiguration;
 import io.github.melswg.worldmind.core.configuration.WorldmindGlobalConfiguration;
 import io.github.melswg.worldmind.core.configuration.WorldmindProfile;
 import io.github.melswg.worldmind.core.conversation.AddressingSignal;
 import io.github.melswg.worldmind.core.conversation.CapturedPublicChatMessage;
 import io.github.melswg.worldmind.core.conversation.ChatBatchAdmission;
+import io.github.melswg.worldmind.core.conversation.LanguageModel;
+import io.github.melswg.worldmind.core.conversation.LanguageModelResult;
+import io.github.melswg.worldmind.core.conversation.ProviderResponse;
 import io.github.melswg.worldmind.core.conversation.ProviderCapabilities;
 import io.github.melswg.worldmind.core.conversation.ServerRequester;
 import io.github.melswg.worldmind.core.conversation.UntrustedContext;
@@ -45,6 +49,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.text.Text;
 import org.junit.jupiter.api.Test;
 
@@ -110,6 +115,67 @@ class FabricChatObservationRuntimeTest {
             sink.broadcasts.stream().map(Text::getString).toList()
         );
         assertFalse(sink.broadcasts.isEmpty());
+    }
+
+    @Test
+    void keepsALaterExactBatchBehindAnEarlierAmbientBatch() {
+        WorldmindAcceptanceScenario scenario = WorldmindTestkit.scenario();
+        scenario.languageModel().willRespondWithSequence("AMBIENT_REPLY\nfirst", "DIRECT_REPLY\nsecond");
+        RecordingSink sink = new RecordingSink();
+        FabricChatObservationRuntime runtime = runtime(
+            scenario,
+            sink,
+            new InMemoryDialogueJournal(WORLD, scenario.clock()),
+            configuration(new ChatBatchingConfiguration(1, 5_000, 4_000), new RequestQueueConfiguration(16, 2))
+        );
+
+        runtime.observeCapturedPublicChat(captured("The rain is loud.", AddressingSignal.NONE), WORLD);
+        runtime.observeCapturedPublicChat(captured("Aster?", AddressingSignal.EXACT), WORLD);
+        scenario.serverScheduler().runUntilIdle();
+
+        assertEquals(List.of("<Aster> first", "<Aster> second"), sink.broadcasts.stream().map(Text::getString).toList());
+        runtime.close();
+    }
+
+    @Test
+    void auditsBatchingOverflowWithoutCallingTheProviderAndOnlyNotifiesExactChat() {
+        CompletableFuture<LanguageModelResult> heldProvider = new CompletableFuture<>();
+        AtomicInteger providerCalls = new AtomicInteger();
+        LanguageModel languageModel = request -> {
+            providerCalls.incrementAndGet();
+            return heldProvider;
+        };
+        WorldmindAcceptanceScenario scenario = new WorldmindAcceptanceScenario(languageModel);
+        RecordingSink sink = new RecordingSink();
+        InMemoryDialogueJournal journal = new InMemoryDialogueJournal(WORLD, scenario.clock());
+        FabricChatObservationRuntime runtime = runtime(
+            scenario,
+            sink,
+            journal,
+            configuration(new ChatBatchingConfiguration(8, 5_000, 4_000), new RequestQueueConfiguration(1, 1))
+        );
+
+        runtime.observeCapturedPublicChat(captured("Aster, first", AddressingSignal.EXACT), WORLD);
+        runtime.observeCapturedPublicChat(captured("Aster, second", AddressingSignal.EXACT), WORLD);
+        runtime.observeCapturedPublicChat(captured("Aster, third", AddressingSignal.EXACT), WORLD);
+        scenario.serverScheduler().runUntilIdle();
+
+        DialogueJournalSnapshot snapshot = join(journal.readSnapshot());
+        JournaledBatch overflow = snapshot.batches().stream()
+            .filter(batch -> batch.sealReason() == io.github.melswg.worldmind.core.conversation.ChatBatchSealReason.BATCHING_CAPACITY_OVERFLOW)
+            .findFirst().orElseThrow();
+        JournalBatchOutcome outcome = snapshot.outcomes().get(overflow.batchId());
+        assertEquals(1, providerCalls.get());
+        assertEquals(ProviderAttemptOutcome.NOT_ATTEMPTED, outcome.providerAttemptOutcome());
+        assertEquals(io.github.melswg.worldmind.core.conversation.RefusalCode.REQUEST_QUEUE_UNAVAILABLE,
+            outcome.refusalCode().orElseThrow());
+        assertEquals(1, sink.privateMessages.size());
+        assertTrue(sink.broadcasts.isEmpty());
+
+        runtime.close();
+        heldProvider.complete(new ProviderResponse("DIRECT_REPLY\nlate"));
+        scenario.serverScheduler().runUntilIdle();
+        assertTrue(sink.broadcasts.isEmpty(), "a provider completion after shutdown cannot route a reply");
     }
 
     @Test
@@ -198,7 +264,7 @@ class FabricChatObservationRuntimeTest {
     }
 
     private FabricChatObservationRuntime runtime(WorldmindAcceptanceScenario scenario, RecordingSink sink) {
-        return runtime(scenario, sink, new InMemoryDialogueJournal(WORLD, scenario.clock()));
+        return runtime(scenario, sink, new InMemoryDialogueJournal(WORLD, scenario.clock()), configuration());
     }
 
     private FabricChatObservationRuntime runtime(
@@ -206,10 +272,19 @@ class FabricChatObservationRuntimeTest {
         RecordingSink sink,
         DialogueJournal journal
     ) {
+        return runtime(scenario, sink, journal, configuration());
+    }
+
+    private FabricChatObservationRuntime runtime(
+        WorldmindAcceptanceScenario scenario,
+        RecordingSink sink,
+        DialogueJournal journal,
+        ValidatedWorldmindConfiguration configuration
+    ) {
         return new FabricChatObservationRuntime(
             WORLD,
             journal,
-            configuration(),
+            configuration,
             scenario.clock(),
             scenario.serverScheduler(),
             () -> { },
@@ -227,7 +302,13 @@ class FabricChatObservationRuntimeTest {
     }
 
     private ValidatedWorldmindConfiguration configuration() {
-        ChatBatchingConfiguration batching = new ChatBatchingConfiguration(8, 5_000, 4_000);
+        return configuration(new ChatBatchingConfiguration(8, 5_000, 4_000), new RequestQueueConfiguration(16, 2));
+    }
+
+    private ValidatedWorldmindConfiguration configuration(
+        ChatBatchingConfiguration batching,
+        RequestQueueConfiguration requestQueue
+    ) {
         return new ValidatedWorldmindConfiguration(
             new WorldmindGlobalConfiguration(
                 WorldmindGlobalConfiguration.V1_SCHEMA_VERSION,
@@ -240,7 +321,8 @@ class FabricChatObservationRuntimeTest {
                     new GenerationParameters(Optional.of(0.4), Optional.empty(), Optional.of(120)),
                     new ExternalSecretReference("env:WORLDMIND_ACCEPTANCE_KEY")
                 ),
-                batching
+                batching,
+                requestQueue
             ),
             new WorldmindProfile(
                 WorldmindProfile.V1_SCHEMA_VERSION,

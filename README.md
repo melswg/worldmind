@@ -49,6 +49,10 @@ file.
     "maxWaitMillis": 5000,
     "maxEstimatedInputCharacters": 4000
   },
+  "requestQueue": {
+    "capacity": 16,
+    "maxConcurrency": 2
+  },
   "provider": {
     "id": "custom-openai-compatible",
     "endpoint": "https://provider.example/v1/chat/completions",
@@ -63,6 +67,12 @@ file.
 message count, elapsed time from its first message, and a stable early Unicode
 character estimate. Reaching a limit includes the triggering message and
 seals the batch; it does not impose a reply quota.
+
+`requestQueue` is also required in v1. `capacity` is the maximum number of
+waiting conversation or memory-compaction jobs; `maxConcurrency` bounds active
+jobs. Both must be positive integers, so the total owned work cannot exceed
+their sum. Invalid or missing values disable the integration before it accepts
+chat.
 
 The selected profile contains only portable character material in
 `profile.json`, plus the referenced Markdown files:
