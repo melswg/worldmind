@@ -139,7 +139,7 @@ class DialogueJournalAcceptanceTest {
 
             http.respondWith(200, response("DIRECT_REPLY\nMemory was available."));
             ServerRequester renamedMira = new ServerRequester(MIRA.playerId(), "MiraTheScout");
-            runtime.observeCapturedPublicChat(message(renamedMira, "Aster!", AddressingSignal.EXACT), journal.openedWorldIdentity());
+            runtime.observeCapturedPublicChat(message(renamedMira, "Aster, observatory Mira trusts", AddressingSignal.EXACT), journal.openedWorldIdentity());
             FakeOpenAiCompatibleHttpServer.CapturedRequest request = awaitProviderAfterMemoryRecall(scenario, http);
             assertTrue(request.body().contains("The observatory is east."));
             assertTrue(request.body().contains("Mira knows the east trail."));

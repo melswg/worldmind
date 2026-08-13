@@ -310,7 +310,9 @@ class FabricChatObservationRuntimeTest {
             return CompletableFuture.failedFuture(new UnsupportedOperationException("unused"));
         }
 
-        @Override public CompletionStage<List<MemoryRecord>> recallPublic(io.github.melswg.worldmind.core.conversation.SealedChatBatch nextBatch) {
+        @Override public CompletionStage<io.github.melswg.worldmind.core.memory.RetrievedMemoryContext> retrievePublic(
+            io.github.melswg.worldmind.core.memory.MemoryRetrievalRequest request
+        ) {
             return CompletableFuture.failedFuture(new IllegalStateException("temporary SQLite read failure"));
         }
 

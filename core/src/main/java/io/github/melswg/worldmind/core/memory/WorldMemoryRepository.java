@@ -13,7 +13,7 @@ public interface WorldMemoryRepository {
 
     CompletionStage<MemoryRecord> confirm(MemoryRecordId recordId, MemoryConfirmationRequest confirmation);
 
-    CompletionStage<List<MemoryRecord>> recallPublic(SealedChatBatch nextBatch);
+    CompletionStage<RetrievedMemoryContext> retrievePublic(MemoryRetrievalRequest request);
 
     CompletionStage<WorldMemorySnapshot> readMemorySnapshot();
 
@@ -43,9 +43,9 @@ public interface WorldMemoryRepository {
         }
 
         @Override
-        public CompletionStage<List<MemoryRecord>> recallPublic(SealedChatBatch nextBatch) {
-            Objects.requireNonNull(nextBatch, "nextBatch");
-            return CompletableFuture.completedFuture(List.of());
+        public CompletionStage<RetrievedMemoryContext> retrievePublic(MemoryRetrievalRequest request) {
+            Objects.requireNonNull(request, "request");
+            return CompletableFuture.completedFuture(RetrievedMemoryContext.empty());
         }
 
         @Override

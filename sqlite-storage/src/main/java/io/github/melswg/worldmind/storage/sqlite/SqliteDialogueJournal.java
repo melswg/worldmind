@@ -44,6 +44,10 @@ import io.github.melswg.worldmind.core.memory.ProposedFactCandidate;
 import io.github.melswg.worldmind.core.memory.ProposedMemoryCandidate;
 import io.github.melswg.worldmind.core.memory.ProposedRelationshipCandidate;
 import io.github.melswg.worldmind.core.memory.RelationshipMemory;
+import io.github.melswg.worldmind.core.memory.MemoryRetrievalRequest;
+import io.github.melswg.worldmind.core.memory.RetrievedMemoryContext;
+import io.github.melswg.worldmind.core.memory.RetrievedMemoryEntry;
+import io.github.melswg.worldmind.core.memory.RetrievedMemoryRecordType;
 import io.github.melswg.worldmind.core.memory.WorldMemoryRepository;
 import io.github.melswg.worldmind.core.memory.WorldMemorySnapshot;
 import java.io.IOException;
@@ -280,44 +284,11 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
     }
 
     @Override
-    public CompletionStage<List<MemoryRecord>> recallPublic(SealedChatBatch nextBatch) {
-        Objects.requireNonNull(nextBatch, "nextBatch");
-        return submit(() -> {
-            if (!worldIdentity.equals(nextBatch.worldIdentity())) {
-                throw new IllegalArgumentException("A memory repository may only recall for its own world.");
-            }
-            long beforeSequence = nextBatch.messages().get(0).sequence();
-            List<String> participantIds = nextBatch.messages().stream()
-                .map(message -> message.requester().playerId().toString())
-                .distinct()
-                .toList();
-            String participants = String.join(", ", java.util.Collections.nCopies(participantIds.size(), "?"));
-            String sql = "SELECT r.record_id, r.record_type, r.record_state, r.content, r.scope_type, r.scope_player_uuid, "
-                + "r.visibility, r.source_batch_id, r.first_sequence, r.last_sequence, r.source_timestamp_epoch_millis, "
-                + "r.recorded_at_epoch_millis, r.confidence, r.importance, r.relationship_subject_uuid, "
-                + "c.authority, c.authority_identifier, c.confirmed_at_epoch_millis "
-                + "FROM memory_records r JOIN memory_confirmations c ON c.record_id = r.record_id "
-                + "WHERE r.record_state = ? AND r.visibility = ? AND r.last_sequence < ? "
-                + "AND (r.scope_type = 'WORLD' OR (r.scope_type = 'PLAYER' AND r.scope_player_uuid IN (" + participants + "))) "
-                + "ORDER BY c.confirmed_at_epoch_millis DESC, r.record_id ASC LIMIT 32";
-            List<MemoryRecord> newestFirst = new ArrayList<>();
-            try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                int parameter = 1;
-                statement.setString(parameter++, MemoryRecordState.CONFIRMED.name());
-                statement.setString(parameter++, MemoryVisibility.PUBLIC.name());
-                statement.setLong(parameter++, beforeSequence);
-                for (String participantId : participantIds) {
-                    statement.setString(parameter++, participantId);
-                }
-                try (ResultSet rows = statement.executeQuery()) {
-                    while (rows.next()) newestFirst.add(memoryRecord(rows));
-                }
-            }
-            newestFirst.sort(java.util.Comparator
-                .comparingLong((MemoryRecord record) -> record.provenance().sourceRange().firstSequence())
-                .thenComparing(record -> record.id().value()));
-            return List.copyOf(newestFirst);
-        });
+    public CompletionStage<io.github.melswg.worldmind.core.memory.RetrievedMemoryContext> retrievePublic(
+        io.github.melswg.worldmind.core.memory.MemoryRetrievalRequest request
+    ) {
+        Objects.requireNonNull(request, "request");
+        return submit(() -> retrievePublicContext(request));
     }
 
     @Override
@@ -337,6 +308,202 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
             return new WorldMemorySnapshot(worldIdentity, records);
         });
     }
+
+    private RetrievedMemoryContext retrievePublicContext(MemoryRetrievalRequest request) throws SQLException {
+        SealedChatBatch nextBatch = request.chatBatch();
+        if (!worldIdentity.equals(nextBatch.worldIdentity())) {
+            throw new IllegalArgumentException("A memory repository may only retrieve for its own world.");
+        }
+        rebuildSearchDocuments(connection);
+        long beforeSequence = nextBatch.messages().get(0).sequence();
+        List<String> participants = nextBatch.messages().stream()
+            .map(message -> message.requester().playerId().toString()).distinct().toList();
+        List<RetrievedMemoryEntry> recent = recentDialogue(beforeSequence);
+        List<RetrievedMemoryEntry> situations = currentSituations(beforeSequence, participants);
+        List<RankedSearchDocument> older = rankedOlderDocuments(nextBatch, beforeSequence, participants);
+        return applyRetrievalBudget(recent, situations, older.stream().map(RankedSearchDocument::entry).toList());
+    }
+
+    private List<RetrievedMemoryEntry> recentDialogue(long beforeSequence) throws SQLException {
+        List<RetrievedMemoryEntry> newestFirst = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement(
+            "SELECT * FROM memory_search_documents d WHERE d.record_type = 'DIALOGUE' AND d.visibility = ? AND d.last_sequence < ? "
+                + "AND NOT EXISTS (SELECT 1 FROM memory_compaction_coverage c WHERE d.last_sequence BETWEEN c.first_sequence AND c.last_sequence) "
+                + "ORDER BY d.last_sequence DESC, d.stable_identity ASC LIMIT 12"
+        )) {
+            statement.setString(1, MemoryVisibility.PUBLIC.name());
+            statement.setLong(2, beforeSequence);
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) newestFirst.add(retrievedEntry(searchDocument(rows)));
+            }
+        }
+        java.util.Collections.reverse(newestFirst);
+        return List.copyOf(newestFirst);
+    }
+
+    private List<RetrievedMemoryEntry> currentSituations(long beforeSequence, List<String> participants) throws SQLException {
+        String scope = String.join(", ", java.util.Collections.nCopies(participants.size(), "?"));
+        String sql = "SELECT s.* FROM memory_current_situation_versions s WHERE s.visibility = ? AND s.last_sequence < ? "
+            + "AND (s.scope_type = 'WORLD' OR (s.scope_type = 'PLAYER' AND s.scope_player_uuid IN (" + scope + "))) "
+            + "AND NOT EXISTS (SELECT 1 FROM memory_current_situation_versions newer WHERE newer.situation_series_id = s.situation_series_id "
+            + "AND newer.version_number > s.version_number) ORDER BY s.recorded_at_epoch_millis DESC, s.situation_version_id ASC LIMIT 4";
+        List<RetrievedMemoryEntry> entries = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            int parameter = 1;
+            statement.setString(parameter++, MemoryVisibility.PUBLIC.name());
+            statement.setLong(parameter++, beforeSequence);
+            for (String participant : participants) statement.setString(parameter++, participant);
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) {
+                    UUID versionId = UUID.fromString(rows.getString("situation_version_id"));
+                    SearchDocument document = new SearchDocument(
+                        RetrievedMemoryRecordType.CURRENT_SITUATION, versionId.toString(), rows.getString("content"), scope(rows),
+                        MemoryVisibility.valueOf(rows.getString("visibility")), range(rows),
+                        Instant.ofEpochMilli(rows.getLong("source_timestamp_epoch_millis")),
+                        Instant.ofEpochMilli(rows.getLong("recorded_at_epoch_millis")), new MemoryConfidence(rows.getDouble("confidence")),
+                        new MemoryImportance(rows.getDouble("importance")), derivedBatchIds("CURRENT_SITUATION", versionId)
+                    );
+                    entries.add(retrievedEntry(document));
+                }
+            }
+        }
+        entries.sort(java.util.Comparator.comparing(RetrievedMemoryEntry::recordedAt).thenComparing(RetrievedMemoryEntry::identity));
+        return List.copyOf(entries);
+    }
+
+    private List<RankedSearchDocument> rankedOlderDocuments(
+        SealedChatBatch nextBatch,
+        long beforeSequence,
+        List<String> participants
+    ) throws SQLException {
+        String query = ftsQuery(nextBatch);
+        if (query.isEmpty()) return List.of();
+        String scope = String.join(", ", java.util.Collections.nCopies(participants.size(), "?"));
+        String sql = "SELECT d.*, bm25(memory_search_fts) AS bm25_score FROM memory_search_fts "
+            + "JOIN memory_search_documents d ON d.document_id = memory_search_fts.rowid "
+            + "WHERE memory_search_fts MATCH ? AND d.visibility = ? AND d.last_sequence < ? "
+            + "AND (d.scope_type = 'WORLD' OR (d.scope_type = 'PLAYER' AND d.scope_player_uuid IN (" + scope + "))) "
+            + "ORDER BY bm25(memory_search_fts), d.last_sequence DESC, d.record_type, d.stable_identity LIMIT 64";
+        List<RankedSearchDocument> candidates = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            int parameter = 1;
+            statement.setString(parameter++, query);
+            statement.setString(parameter++, MemoryVisibility.PUBLIC.name());
+            statement.setLong(parameter++, beforeSequence);
+            for (String participant : participants) statement.setString(parameter++, participant);
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) {
+                    SearchDocument document = searchDocument(rows);
+                    double relevance = 1.0 / (1.0 + Math.abs(rows.getDouble("bm25_score")));
+                    double recency = Math.max(0.0, Math.min(1.0, 1.0 - ((double) (beforeSequence - document.range.lastSequence()) / 10_000.0)));
+                    candidates.add(new RankedSearchDocument(retrievedEntry(document), 0.70 * relevance + 0.20 * recency
+                        + 0.10 * document.importance.value()));
+                }
+            }
+        }
+        candidates.sort(java.util.Comparator.comparingDouble(RankedSearchDocument::score).reversed()
+            .thenComparing((RankedSearchDocument value) -> value.entry.provenance().sourceRange().lastSequence(), java.util.Comparator.reverseOrder())
+            .thenComparing(value -> value.entry.type())
+            .thenComparing(value -> value.entry.identity()));
+        return candidates.stream().limit(12).toList();
+    }
+
+    private RetrievedMemoryContext applyRetrievalBudget(
+        List<RetrievedMemoryEntry> recent,
+        List<RetrievedMemoryEntry> situations,
+        List<RetrievedMemoryEntry> older
+    ) {
+        List<RetrievedMemoryEntry> selectedRecent = new ArrayList<>();
+        List<RetrievedMemoryEntry> selectedSituations = new ArrayList<>();
+        List<RetrievedMemoryEntry> selectedOlder = new ArrayList<>();
+        int[] used = {0};
+        // Preserve the newest current view before spending the finite memory budget on dialogue history.
+        addWithinBudget(situations, selectedSituations, used);
+        addWithinBudget(recent, selectedRecent, used, 700);
+        addWithinBudget(older, selectedOlder, used);
+        return new RetrievedMemoryContext(selectedRecent, selectedSituations, selectedOlder);
+    }
+
+    private void addWithinBudget(List<RetrievedMemoryEntry> source, List<RetrievedMemoryEntry> target, int[] used) {
+        addWithinBudget(source, target, used, 0);
+    }
+
+    private void addWithinBudget(List<RetrievedMemoryEntry> source, List<RetrievedMemoryEntry> target, int[] used, int reservedForLater) {
+        for (RetrievedMemoryEntry entry : source) {
+            int cost = serializedMemoryCost(entry);
+            if (used[0] + cost > RetrievedMemoryContext.MAX_SERIALIZED_CODE_POINTS - reservedForLater) break;
+            target.add(entry);
+            used[0] += cost;
+        }
+    }
+
+    private static int serializedMemoryCost(RetrievedMemoryEntry entry) {
+        return 96 + entry.type().name().length() + entry.identity().toString().length()
+            + entry.content().codePointCount(0, entry.content().length())
+            + entry.provenance().sourceBatchIds().size() * 38;
+    }
+
+    private SearchDocument searchDocument(ResultSet row) throws SQLException {
+        return new SearchDocument(
+            RetrievedMemoryRecordType.valueOf(row.getString("record_type")), row.getString("stable_identity"), row.getString("content"),
+            scope(row), MemoryVisibility.valueOf(row.getString("visibility")), range(row),
+            Instant.ofEpochMilli(row.getLong("source_timestamp_epoch_millis")), Instant.ofEpochMilli(row.getLong("recorded_at_epoch_millis")),
+            new MemoryConfidence(row.getDouble("confidence")), new MemoryImportance(row.getDouble("importance")),
+            parseBatchIds(row.getString("source_batch_ids"))
+        );
+    }
+
+    private RetrievedMemoryEntry retrievedEntry(SearchDocument document) {
+        return new RetrievedMemoryEntry(document.type, stableIdentity(document.stableIdentity),
+            new DerivedMemoryProvenance(document.range, document.sourceBatchIds), document.sourceTimestamp, document.recordedAt,
+            document.confidence, document.importance, document.scope, document.visibility, truncateCodePoints(document.content, 600));
+    }
+
+    private static UUID stableIdentity(String stableIdentity) {
+        int colon = stableIdentity.indexOf(':');
+        String value = colon < 0 ? stableIdentity : stableIdentity.substring(colon + 1);
+        try { return UUID.fromString(value); }
+        catch (IllegalArgumentException ignored) { return UUID.nameUUIDFromBytes(stableIdentity.getBytes(java.nio.charset.StandardCharsets.UTF_8)); }
+    }
+
+    private static List<UUID> parseBatchIds(String value) {
+        if (value == null || value.isBlank()) throw new IllegalArgumentException("Public search document has no source batch.");
+        return java.util.Arrays.stream(value.split(",", -1)).map(UUID::fromString).toList();
+    }
+
+    private static String truncateCodePoints(String value, int maximum) {
+        if (value.codePointCount(0, value.length()) <= maximum) return value;
+        return value.substring(0, value.offsetByCodePoints(0, maximum - 1)) + "…";
+    }
+
+    private static String ftsQuery(SealedChatBatch batch) {
+        java.util.LinkedHashSet<String> terms = new java.util.LinkedHashSet<>();
+        String joined = batch.messages().stream().map(message -> message.message()).collect(java.util.stream.Collectors.joining(" "));
+        for (String term : joined.toLowerCase(java.util.Locale.ROOT).split("[^\\p{L}\\p{N}]+")) {
+            if (term.codePointCount(0, term.length()) >= 2 && terms.size() < 16) terms.add(term);
+        }
+        String query = terms.stream().map(term -> "\"" + term.replace("\"", "") + "\"").collect(java.util.stream.Collectors.joining(" OR "));
+        return query.codePointCount(0, query.length()) <= 256 ? query : truncateCodePoints(query, 256);
+    }
+
+    private List<UUID> derivedBatchIds(String kind, UUID recordId) throws SQLException {
+        List<UUID> result = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement(
+            "SELECT batch_id FROM memory_derived_sources WHERE record_kind = ? AND record_id = ? ORDER BY ordinal"
+        )) {
+            statement.setString(1, kind); statement.setString(2, recordId.toString());
+            try (ResultSet rows = statement.executeQuery()) { while (rows.next()) result.add(UUID.fromString(rows.getString(1))); }
+        }
+        return List.copyOf(result);
+    }
+
+    private record SearchDocument(
+        RetrievedMemoryRecordType type, String stableIdentity, String content, MemoryScope scope, MemoryVisibility visibility,
+        JournalSequenceRange range, Instant sourceTimestamp, Instant recordedAt, MemoryConfidence confidence,
+        MemoryImportance importance, List<UUID> sourceBatchIds
+    ) { }
+
+    private record RankedSearchDocument(RetrievedMemoryEntry entry, double score) { }
 
     @Override
     public CompletionStage<Optional<MemoryCompactionInput>> nextCompaction(WorldIdentity requestedWorld) {
@@ -970,6 +1137,7 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
         } else {
             createSchemaV1(connection);
         }
+        rebuildSearchDocuments(connection);
     }
 
     private static void createSchemaV1(Connection connection) throws SQLException {
@@ -992,6 +1160,25 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
             statement.execute("CREATE INDEX IF NOT EXISTS memory_summary_versions_source_range_idx ON memory_summary_versions(first_sequence, last_sequence)");
             statement.execute("CREATE INDEX IF NOT EXISTS memory_situations_scope_idx ON memory_current_situation_versions(scope_type, scope_player_uuid, visibility, version_number)");
             statement.execute("CREATE INDEX IF NOT EXISTS memory_coverage_range_idx ON memory_compaction_coverage(first_sequence, last_sequence)");
+            statement.execute("CREATE TABLE IF NOT EXISTS memory_search_documents (document_id INTEGER PRIMARY KEY AUTOINCREMENT, record_type TEXT NOT NULL CHECK(record_type IN ('DIALOGUE', 'FACT', 'RELATIONSHIP', 'EVENT', 'SUMMARY')), stable_identity TEXT NOT NULL UNIQUE, content TEXT NOT NULL CHECK(length(trim(content)) > 0), scope_type TEXT NOT NULL CHECK(scope_type IN ('WORLD', 'PLAYER')), scope_player_uuid TEXT, visibility TEXT NOT NULL CHECK(visibility IN ('PUBLIC', 'PRIVATE')), first_sequence INTEGER NOT NULL, last_sequence INTEGER NOT NULL, source_timestamp_epoch_millis INTEGER NOT NULL, recorded_at_epoch_millis INTEGER NOT NULL, confidence REAL NOT NULL CHECK(confidence >= 0.0 AND confidence <= 1.0), importance REAL NOT NULL CHECK(importance >= 0.0 AND importance <= 1.0), source_batch_ids TEXT NOT NULL CHECK(length(trim(source_batch_ids)) > 0), CHECK((scope_type = 'WORLD' AND scope_player_uuid IS NULL) OR (scope_type = 'PLAYER' AND scope_player_uuid IS NOT NULL)), CHECK(last_sequence >= first_sequence))");
+            statement.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_search_fts USING fts5(content, content='memory_search_documents', content_rowid='document_id')");
+            statement.execute("CREATE INDEX IF NOT EXISTS memory_search_documents_scope_idx ON memory_search_documents(visibility, scope_type, scope_player_uuid, last_sequence)");
+        }
+    }
+
+    /** Deterministically rebuilds the local public-only canonical documents and FTS5 index from v1 source tables. */
+    private static void rebuildSearchDocuments(Connection connection) throws SQLException {
+        try (Statement statement = connection.createStatement()) {
+            statement.executeUpdate("DELETE FROM memory_search_documents");
+            statement.executeUpdate("INSERT INTO memory_search_documents(record_type, stable_identity, content, scope_type, scope_player_uuid, visibility, first_sequence, last_sequence, source_timestamp_epoch_millis, recorded_at_epoch_millis, confidence, importance, source_batch_ids) "
+                + "SELECT 'DIALOGUE', 'dialogue:' || j.sequence, j.message_text, 'WORLD', NULL, 'PUBLIC', j.sequence, j.sequence, j.captured_at_epoch_millis, j.captured_at_epoch_millis, 1.0, 0.2, bm.batch_id FROM journal_messages j JOIN journal_batch_messages bm ON bm.message_sequence = j.sequence WHERE j.visibility = 'PUBLIC'");
+            statement.executeUpdate("INSERT INTO memory_search_documents(record_type, stable_identity, content, scope_type, scope_player_uuid, visibility, first_sequence, last_sequence, source_timestamp_epoch_millis, recorded_at_epoch_millis, confidence, importance, source_batch_ids) "
+                + "SELECT r.record_type, lower(r.record_type) || ':' || r.record_id, r.content, r.scope_type, r.scope_player_uuid, r.visibility, r.first_sequence, r.last_sequence, r.source_timestamp_epoch_millis, r.recorded_at_epoch_millis, r.confidence, r.importance, r.source_batch_id FROM memory_records r JOIN memory_confirmations c ON c.record_id = r.record_id WHERE r.record_state = 'CONFIRMED' AND r.visibility = 'PUBLIC'");
+            statement.executeUpdate("INSERT INTO memory_search_documents(record_type, stable_identity, content, scope_type, scope_player_uuid, visibility, first_sequence, last_sequence, source_timestamp_epoch_millis, recorded_at_epoch_millis, confidence, importance, source_batch_ids) "
+                + "SELECT 'EVENT', 'event:' || e.event_id, e.content, e.scope_type, e.scope_player_uuid, e.visibility, e.first_sequence, e.last_sequence, e.source_timestamp_epoch_millis, e.recorded_at_epoch_millis, e.confidence, e.importance, (SELECT group_concat(batch_id, ',') FROM (SELECT batch_id FROM memory_derived_sources ds WHERE ds.record_kind = 'EVENT' AND ds.record_id = e.event_id ORDER BY ordinal)) FROM memory_events e WHERE e.visibility = 'PUBLIC'");
+            statement.executeUpdate("INSERT INTO memory_search_documents(record_type, stable_identity, content, scope_type, scope_player_uuid, visibility, first_sequence, last_sequence, source_timestamp_epoch_millis, recorded_at_epoch_millis, confidence, importance, source_batch_ids) "
+                + "SELECT 'SUMMARY', 'summary:' || s.summary_version_id, s.content, s.scope_type, s.scope_player_uuid, s.visibility, s.first_sequence, s.last_sequence, s.source_timestamp_epoch_millis, s.recorded_at_epoch_millis, s.confidence, s.importance, (SELECT group_concat(batch_id, ',') FROM (SELECT batch_id FROM memory_derived_sources ds WHERE ds.record_kind = 'SUMMARY' AND ds.record_id = s.summary_version_id ORDER BY ordinal)) FROM memory_summary_versions s WHERE s.visibility = 'PUBLIC'");
+            statement.execute("INSERT INTO memory_search_fts(memory_search_fts) VALUES('rebuild')");
         }
     }
 

@@ -1,8 +1,8 @@
 package io.github.melswg.worldmind.core.conversation;
 
-import io.github.melswg.worldmind.core.memory.MemoryRecord;
+import io.github.melswg.worldmind.core.memory.MemoryRetrievalRequest;
+import io.github.melswg.worldmind.core.memory.RetrievedMemoryContext;
 import io.github.melswg.worldmind.core.memory.WorldMemoryRepository;
-import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -41,12 +41,12 @@ public final class ConversationApplicationService {
             return scheduled(new ConversationRefusal(RefusalCode.PROVIDER_INCOMPATIBLE));
         }
         if (memoryRepository == WorldMemoryRepository.empty()) {
-            return handleWithMemory(request, List.of());
+            return handleWithMemory(request, RetrievedMemoryContext.empty());
         }
 
-        CompletionStage<List<MemoryRecord>> recalled;
+        CompletionStage<RetrievedMemoryContext> recalled;
         try {
-            recalled = memoryRepository.recallPublic(request.chatBatch());
+            recalled = memoryRepository.retrievePublic(new MemoryRetrievalRequest(request.chatBatch()));
             if (recalled == null) {
                 recalled = CompletableFuture.failedFuture(new IllegalStateException("Memory repository returned no recall stage."));
             }
@@ -62,10 +62,7 @@ public final class ConversationApplicationService {
         }, serverScheduler).thenCompose(stage -> stage);
     }
 
-    private CompletionStage<ConversationOutcome> handleWithMemory(
-        NormalizedServerRequest request,
-        List<MemoryRecord> memory
-    ) {
+    private CompletionStage<ConversationOutcome> handleWithMemory(NormalizedServerRequest request, RetrievedMemoryContext memory) {
         Optional<ProviderRequest> providerRequest = promptBuilder.build(request, memory);
         if (providerRequest.isEmpty()) {
             return scheduled(new ConversationRefusal(RefusalCode.PROMPT_BUDGET_EXCEEDED));

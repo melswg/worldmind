@@ -33,6 +33,10 @@ import io.github.melswg.worldmind.core.memory.MemoryFact;
 import io.github.melswg.worldmind.core.memory.MemoryImportance;
 import io.github.melswg.worldmind.core.memory.MemoryProvenance;
 import io.github.melswg.worldmind.core.memory.MemoryRecord;
+import io.github.melswg.worldmind.core.memory.MemoryRetrievalRequest;
+import io.github.melswg.worldmind.core.memory.RetrievedMemoryContext;
+import io.github.melswg.worldmind.core.memory.RetrievedMemoryEntry;
+import io.github.melswg.worldmind.core.memory.RetrievedMemoryRecordType;
 import io.github.melswg.worldmind.core.memory.MemoryRecordId;
 import io.github.melswg.worldmind.core.memory.MemoryRecordState;
 import io.github.melswg.worldmind.core.memory.MemoryScope;
@@ -139,8 +143,14 @@ class MemoryRecallAcceptanceTest {
             return CompletableFuture.failedFuture(new UnsupportedOperationException("unused"));
         }
 
-        @Override public CompletionStage<List<MemoryRecord>> recallPublic(SealedChatBatch nextBatch) {
-            return CompletableFuture.completedFuture(records);
+        @Override public CompletionStage<RetrievedMemoryContext> retrievePublic(MemoryRetrievalRequest request) {
+            MemoryFact fact = (MemoryFact) records.get(0);
+            return CompletableFuture.completedFuture(new RetrievedMemoryContext(List.of(), List.of(), List.of(new RetrievedMemoryEntry(
+                RetrievedMemoryRecordType.FACT, fact.id().value(),
+                new io.github.melswg.worldmind.core.memory.DerivedMemoryProvenance(
+                    fact.provenance().sourceRange(), List.of(fact.provenance().sourceBatchId())
+                ), fact.sourceTimestamp(), fact.recordedAt(), fact.confidence(), fact.importance(), fact.scope(), fact.visibility(), fact.content()
+            ))));
         }
 
         @Override public CompletionStage<WorldMemorySnapshot> readMemorySnapshot() {

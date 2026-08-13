@@ -2,9 +2,8 @@ package io.github.melswg.worldmind.core.conversation;
 
 import io.github.melswg.worldmind.core.configuration.LoreMaterial;
 import io.github.melswg.worldmind.core.configuration.WorldmindProfile;
-import io.github.melswg.worldmind.core.memory.MemoryFact;
-import io.github.melswg.worldmind.core.memory.MemoryRecord;
-import io.github.melswg.worldmind.core.memory.RelationshipMemory;
+import io.github.melswg.worldmind.core.memory.RetrievedMemoryContext;
+import io.github.melswg.worldmind.core.memory.RetrievedMemoryEntry;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -12,9 +11,9 @@ import java.util.Optional;
 
 /** Builds the fixed v1 prompt structure independently of provider transport details. */
 final class ConversationPromptBuilder {
-    Optional<ProviderRequest> build(NormalizedServerRequest request, List<MemoryRecord> recalledMemory) {
+    Optional<ProviderRequest> build(NormalizedServerRequest request, RetrievedMemoryContext recalledMemory) {
         Objects.requireNonNull(request, "request");
-        recalledMemory = List.copyOf(Objects.requireNonNull(recalledMemory, "recalledMemory"));
+        recalledMemory = Objects.requireNonNull(recalledMemory, "recalledMemory");
         WorldmindProfile profile = request.validatedConfiguration().profile();
         List<PromptLayer> layers = new ArrayList<>();
         layers.add(new PromptLayer(
@@ -43,7 +42,7 @@ final class ConversationPromptBuilder {
         layers.add(new PromptLayer(
             PromptLayerType.MEMORY,
             PromptTrust.UNTRUSTED_DATA,
-            recalledMemory.stream().map(this::memoryFragment).toList()
+            recalledMemory.entriesInPromptOrder().stream().map(this::memoryFragment).toList()
         ));
         layers.add(new PromptLayer(
             PromptLayerType.CURRENT_GAME_CONTEXT,
@@ -75,32 +74,21 @@ final class ConversationPromptBuilder {
         return new PromptFragment(context.source(), context.content());
     }
 
-    private PromptFragment memoryFragment(MemoryRecord record) {
-        String header = "recordType: " + (record instanceof MemoryFact ? "FACT" : "RELATIONSHIP") + "\n"
-            + "state: " + record.state() + "\n"
+    private PromptFragment memoryFragment(RetrievedMemoryEntry record) {
+        String header = "recordType: " + record.type() + "\n"
             + "scope: " + serializeScope(record) + "\n"
             + "visibility: " + record.visibility() + "\n"
-            + "sourceBatchId: " + record.provenance().sourceBatchId() + "\n"
+            + "sourceBatchIds: " + record.provenance().sourceBatchIds() + "\n"
             + "sourceSequenceRange: " + record.provenance().sourceRange().firstSequence()
                 + "-" + record.provenance().sourceRange().lastSequence() + "\n"
             + "sourceTimestamp: " + record.sourceTimestamp() + "\n"
             + "recordedAt: " + record.recordedAt() + "\n"
             + "confidence: " + record.confidence().value() + "\n"
-            + "importance: " + record.importance().value() + "\n"
-            + "confirmation: " + record.confirmation().map(value -> value.authority() + ":" + value.authorityIdentifier()
-                + " at " + value.confirmedAt()).orElse("none") + "\n";
-        if (record instanceof MemoryFact fact) {
-            return new PromptFragment("world-memory-record." + fact.id().value(), header + "content: " + fact.content());
-        }
-        RelationshipMemory relationship = (RelationshipMemory) record;
-        return new PromptFragment(
-            "world-memory-record." + relationship.id().value(),
-            header + "relationshipSubjectUuid: " + relationship.subjectPlayerId() + "\n"
-                + "relationshipState: " + relationship.relationshipState()
-        );
+            + "importance: " + record.importance().value() + "\n";
+        return new PromptFragment("world-memory-record." + record.identity(), header + "content: " + record.content());
     }
 
-    private String serializeScope(MemoryRecord record) {
+    private String serializeScope(RetrievedMemoryEntry record) {
         if (record.scope() instanceof io.github.melswg.worldmind.core.memory.MemoryScope.World) {
             return "WORLD";
         }

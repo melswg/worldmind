@@ -20,6 +20,8 @@ import io.github.melswg.worldmind.core.memory.MemoryConfidence;
 import io.github.melswg.worldmind.core.memory.MemoryFact;
 import io.github.melswg.worldmind.core.memory.MemoryImportance;
 import io.github.melswg.worldmind.core.memory.MemoryRecord;
+import io.github.melswg.worldmind.core.memory.MemoryRetrievalRequest;
+import io.github.melswg.worldmind.core.memory.RetrievedMemoryEntry;
 import io.github.melswg.worldmind.core.memory.MemoryRecordState;
 import io.github.melswg.worldmind.core.memory.MemoryScope;
 import io.github.melswg.worldmind.core.memory.MemoryVisibility;
@@ -73,18 +75,25 @@ class SqliteWorldMemoryRepositoryTest {
         join(first.closeAsync());
 
         SqliteDialogueJournal reopened = open(database);
-        List<MemoryRecord> recalled = join(reopened.recallPublic(nextBatch(reopened, RENAMED_MIRA, 3)));
-        assertEquals(3, recalled.size());
+        List<RetrievedMemoryEntry> recalled = join(reopened.retrievePublic(new MemoryRetrievalRequest(
+            nextBatch(reopened, RENAMED_MIRA, 3, "observatory Mira trusted")
+        ))).olderRecords();
+        List<RetrievedMemoryEntry> recalledRecords = recalled.stream()
+            .filter(record -> record.type() != io.github.melswg.worldmind.core.memory.RetrievedMemoryRecordType.DIALOGUE).toList();
+        assertEquals(3, recalledRecords.size());
         assertEquals(
             java.util.Set.of("The observatory is east.", "Mira carries the map.", "trusted scout"),
-            new java.util.HashSet<>(recalled.stream().map(this::content).toList())
+            new java.util.HashSet<>(recalledRecords.stream().map(this::content).toList())
         );
-        assertTrue(recalled.stream().allMatch(record -> record.state() == MemoryRecordState.CONFIRMED));
         assertTrue(recalled.stream().allMatch(record -> record.visibility() == MemoryVisibility.PUBLIC));
 
-        List<MemoryRecord> differentUuid = join(reopened.recallPublic(nextBatch(reopened, OTHER, 3)));
+        List<RetrievedMemoryEntry> differentUuid = join(reopened.retrievePublic(new MemoryRetrievalRequest(
+            nextBatch(reopened, OTHER, 3, "observatory bridge")
+        ))).olderRecords();
         assertEquals(java.util.Set.of("The observatory is east.", "Other Mira built the bridge."),
-            new java.util.HashSet<>(differentUuid.stream().map(this::content).toList()));
+            new java.util.HashSet<>(differentUuid.stream()
+                .filter(record -> record.type() != io.github.melswg.worldmind.core.memory.RetrievedMemoryRecordType.DIALOGUE)
+                .map(this::content).toList()));
 
         List<MemoryRecord> snapshot = join(reopened.readMemorySnapshot()).records();
         assertEquals(7, snapshot.size());
@@ -114,8 +123,8 @@ class SqliteWorldMemoryRepositoryTest {
         join(journal.confirm(confirmed.id(), new MemoryConfirmationRequest(
             MemoryConfirmationAuthority.DETERMINISTIC_POLICY, "test"
         )));
-        assertTrue(join(journal.recallPublic(nextBatch(journal, MIRA, 2))).isEmpty());
-        assertEquals(1, join(journal.recallPublic(nextBatch(journal, MIRA, 3))).size());
+        assertTrue(join(journal.retrievePublic(new MemoryRetrievalRequest(nextBatch(journal, MIRA, 2, "prior")))).olderRecords().isEmpty());
+        assertEquals(1, join(journal.retrievePublic(new MemoryRetrievalRequest(nextBatch(journal, MIRA, 3, "prior")))).olderRecords().size());
         join(journal.closeAsync());
     }
 
@@ -144,11 +153,11 @@ class SqliteWorldMemoryRepositoryTest {
         )));
     }
 
-    private SealedChatBatch nextBatch(SqliteDialogueJournal journal, ServerRequester requester, long firstSequence) {
+    private SealedChatBatch nextBatch(SqliteDialogueJournal journal, ServerRequester requester, long firstSequence, String text) {
         return new SealedChatBatch(
             journal.openedWorldIdentity(),
             List.of(new io.github.melswg.worldmind.core.conversation.ObservedPublicChatMessage(
-                firstSequence, requester, "Aster!", AddressingSignal.EXACT, Instant.EPOCH, List.of()
+                firstSequence, requester, text, AddressingSignal.EXACT, Instant.EPOCH, List.of()
             )),
             ChatBatchSealReason.ADDRESSING_SIGNAL,
             List.of()
@@ -186,7 +195,8 @@ class SqliteWorldMemoryRepositoryTest {
         return join(SqliteDialogueJournal.open(path));
     }
 
-    private String content(MemoryRecord record) {
+    private String content(Object record) {
+        if (record instanceof RetrievedMemoryEntry entry) return entry.content();
         return record instanceof MemoryFact fact ? fact.content() : ((RelationshipMemory) record).relationshipState();
     }
 
