@@ -13,5 +13,5 @@ public interface ProviderCredentialResolver extends SecretResolver {
      * Returns material solely for building an outgoing authorization header.
      * Callers must not retain, log, or expose the returned value.
      */
-    Optional<String> resolveForOutgoingRequest(ExternalSecretReference reference);
+    Optional<ProviderCredential> resolveForOutgoingRequest(ExternalSecretReference reference);
 }

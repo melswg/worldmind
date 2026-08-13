@@ -304,8 +304,8 @@ class CustomOpenAiCompatibleLanguageModelTest {
         }
 
         @Override
-        public Optional<String> resolveForOutgoingRequest(ExternalSecretReference reference) {
-            return material;
+        public Optional<ProviderCredential> resolveForOutgoingRequest(ExternalSecretReference reference) {
+            return material.map(ProviderCredential::new);
         }
     }
 }

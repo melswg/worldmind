@@ -7,5 +7,6 @@ package io.github.melswg.worldmind.core.configuration;
 public enum SecretAvailability {
     AVAILABLE,
     MISSING,
-    UNREADABLE
+    UNREADABLE,
+    REJECTED
 }

@@ -37,14 +37,14 @@ public final class EnvironmentProviderCredentialResolver implements ProviderCred
     }
 
     @Override
-    public Optional<String> resolveForOutgoingRequest(ExternalSecretReference reference) {
+    public Optional<ProviderCredential> resolveForOutgoingRequest(ExternalSecretReference reference) {
         Matcher matcher = matcher(reference);
         if (matcher == null) {
             return Optional.empty();
         }
         try {
             String material = environment.apply(matcher.group(1));
-            return material == null || material.isBlank() ? Optional.empty() : Optional.of(material);
+            return material == null || material.isBlank() ? Optional.empty() : Optional.of(new ProviderCredential(material));
         } catch (RuntimeException failure) {
             return Optional.empty();
         }

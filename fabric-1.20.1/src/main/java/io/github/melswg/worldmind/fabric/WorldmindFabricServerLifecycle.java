@@ -211,9 +211,8 @@ final class WorldmindFabricServerLifecycle {
         if (diagnostic.queueSnapshot().isPresent()) {
             var queue = diagnostic.queueSnapshot().orElseThrow();
             LOGGER.warn(
-                "Worldmind {} work for opaque world {} at chat batch {}-{}; queued={}, active={}",
+                "Worldmind {} work at chat batch {}-{}; queued={}, active={}",
                 diagnostic.workKind().orElseThrow(),
-                diagnostic.opaqueWorldIdentity().orElseThrow(),
                 diagnostic.firstSequence(),
                 diagnostic.lastSequence(),
                 queue.queued(),

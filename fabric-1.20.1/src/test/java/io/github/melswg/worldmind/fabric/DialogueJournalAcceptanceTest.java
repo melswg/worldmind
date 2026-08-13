@@ -184,8 +184,8 @@ class DialogueJournalAcceptanceTest {
         return new WorldmindAcceptanceScenario(new CustomOpenAiCompatibleLanguageModel(
             provider, HttpClient.newHttpClient(), new ProviderCredentialResolver() {
                 @Override public SecretAvailability check(ExternalSecretReference reference) { return SecretAvailability.AVAILABLE; }
-                @Override public Optional<String> resolveForOutgoingRequest(ExternalSecretReference reference) {
-                    return Optional.of("fake-http-credential");
+                @Override public Optional<io.github.melswg.worldmind.fabric.provider.ProviderCredential> resolveForOutgoingRequest(ExternalSecretReference reference) {
+                    return Optional.of(new io.github.melswg.worldmind.fabric.provider.ProviderCredential("fake-http-credential"));
                 }
             }
         ));
@@ -195,8 +195,8 @@ class DialogueJournalAcceptanceTest {
         return new WorldmindAcceptanceScenario(new CustomOpenAiCompatibleLanguageModel(
             provider, HttpClient.newHttpClient(), new ProviderCredentialResolver() {
                 @Override public SecretAvailability check(ExternalSecretReference reference) { return SecretAvailability.AVAILABLE; }
-                @Override public Optional<String> resolveForOutgoingRequest(ExternalSecretReference reference) {
-                    return Optional.of("fake-http-credential");
+                @Override public Optional<io.github.melswg.worldmind.fabric.provider.ProviderCredential> resolveForOutgoingRequest(ExternalSecretReference reference) {
+                    return Optional.of(new io.github.melswg.worldmind.fabric.provider.ProviderCredential("fake-http-credential"));
                 }
             }
         ), memory);

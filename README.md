@@ -100,12 +100,15 @@ vanilla palette name: `black`, `dark_blue`, `dark_green`, `dark_aqua`,
 `aqua`, `red`, `light_purple`, `yellow`, or `white`.
 
 `secretReference` belongs only in the global configuration; portable profiles
-cannot contain it. v1 accepts only `env:NAME`, read from the server process
-environment. A missing or unreadable secret disables only the LLM integration
+cannot contain it. The bundled resolver accepts `env:NAME`; deployments can
+replace the resolver for another `scheme:opaque-reference`. A missing,
+unreadable, or rejected secret disables only the LLM integration
 and emits field-specific diagnostics; Minecraft keeps running. The profile,
 provider request, diagnostics, and example configuration never contain its
 value. The configured endpoint is the full Chat Completions URI; HTTPS is
 required except for local loopback HTTP used in tests or local development.
+Use a separate spending-limited key per deployment; Worldmind never creates or
+manages credentials.
 
 `timeouts` is required in v1. `connectMillis` bounds a new TCP/TLS connection;
 `responseCompletionMillis` bounds the complete HTTP exchange and response body.

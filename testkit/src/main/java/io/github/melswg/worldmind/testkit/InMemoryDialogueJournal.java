@@ -3,6 +3,7 @@ package io.github.melswg.worldmind.testkit;
 import io.github.melswg.worldmind.core.conversation.CapturedPublicChatMessage;
 import io.github.melswg.worldmind.core.conversation.SealedChatBatch;
 import io.github.melswg.worldmind.core.conversation.WorldIdentity;
+import io.github.melswg.worldmind.core.configuration.SecretRedactionPolicy;
 import io.github.melswg.worldmind.core.journal.DialogueJournal;
 import io.github.melswg.worldmind.core.journal.DialogueJournalSnapshot;
 import io.github.melswg.worldmind.core.journal.JournalBatchOutcome;
@@ -37,8 +38,9 @@ public final class InMemoryDialogueJournal implements DialogueJournal {
     @Override public synchronized CompletionStage<JournaledObservation> appendObservation(CapturedPublicChatMessage observation) {
         if (closed) return failed(new IllegalStateException("Dialogue journal is closed."));
         long sequence = observations.size() + 1L;
+        String redactedMessage = SecretRedactionPolicy.redact(observation.message());
         JournaledObservation journaled = new JournaledObservation(
-            worldIdentity, sequence, observation.requester(), observation.message(), observation.capturedAt(),
+            worldIdentity, sequence, observation.requester(), redactedMessage, observation.capturedAt(),
             JournalMessageSource.PUBLIC_CHAT, JournalVisibility.PUBLIC, observation.addressingSignal()
         );
         observations.add(journaled);

@@ -53,7 +53,7 @@ public final class WorldmindStartupConfigurationLoader {
     private static final String GLOBAL_FILE_NAME = "worldmind.json";
     private static final String PROFILE_FILE_NAME = "profile.json";
     private static final Pattern PROFILE_ID = Pattern.compile("[a-z0-9][a-z0-9-]{0,63}");
-    private static final Pattern ENV_SECRET_REFERENCE = Pattern.compile("env:[A-Za-z_][A-Za-z0-9_]*");
+    private static final Pattern SECRET_REFERENCE = Pattern.compile("[a-z][a-z0-9-]{0,31}:[^\\s]+", Pattern.CASE_INSENSITIVE);
     private static final String CUSTOM_OPENAI_COMPATIBLE = "custom-openai-compatible";
     private static final Set<String> GLOBAL_FIELDS = Set.of(
         "schemaVersion",
@@ -154,6 +154,12 @@ public final class WorldmindStartupConfigurationLoader {
             availability = secretResolver.check(globalConfiguration.provider().secretReference());
         } catch (RuntimeException failure) {
             availability = SecretAvailability.UNREADABLE;
+        }
+        if (availability == SecretAvailability.REJECTED) {
+            return disabled(
+                IntegrationDisableReason.CREDENTIAL_REJECTED,
+                List.of(new ConfigurationDiagnostic("global.provider.secretReference", "Credential material was rejected."))
+            );
         }
         if (availability == null || availability == SecretAvailability.UNREADABLE) {
             return disabled(
@@ -397,11 +403,11 @@ public final class WorldmindStartupConfigurationLoader {
     }
 
     private void validateSecretReference(String secretReference, List<ConfigurationDiagnostic> diagnostics) {
-        if (secretReference != null && !ENV_SECRET_REFERENCE.matcher(secretReference).matches()) {
+        if (secretReference != null && !SECRET_REFERENCE.matcher(secretReference).matches()) {
             diagnostic(
                 diagnostics,
                 "global.provider.secretReference",
-                "must use the env:NAME reference format."
+                "must use a provider-scheme:opaque-reference format."
             );
         }
     }

@@ -71,13 +71,13 @@ public final class CustomOpenAiCompatibleLanguageModel implements LanguageModel 
             return unavailable();
         }
         try {
-            Optional<String> credential = credentials.resolveForOutgoingRequest(configuration.secretReference());
-            if (credential.isEmpty() || credential.get().isBlank()) {
+            Optional<ProviderCredential> credential = credentials.resolveForOutgoingRequest(configuration.secretReference());
+            if (credential.isEmpty()) {
                 return unavailable();
             }
             HttpRequest request = HttpRequest.newBuilder(configuration.endpoint().uri())
                 .timeout(Duration.ofMillis(configuration.timeouts().responseCompletionMillis()))
-                .header("Authorization", "Bearer " + credential.get())
+                .header("Authorization", "Bearer " + credential.orElseThrow().authorizationValue())
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(serializeRequest(providerRequest), StandardCharsets.UTF_8))

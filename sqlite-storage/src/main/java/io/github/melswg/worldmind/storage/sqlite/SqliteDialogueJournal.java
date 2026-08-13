@@ -18,6 +18,7 @@ import io.github.melswg.worldmind.core.journal.JournalVisibility;
 import io.github.melswg.worldmind.core.journal.JournaledBatch;
 import io.github.melswg.worldmind.core.journal.JournaledObservation;
 import io.github.melswg.worldmind.core.journal.ProviderAttemptOutcome;
+import io.github.melswg.worldmind.core.configuration.SecretRedactionPolicy;
 import io.github.melswg.worldmind.core.memory.JournalSequenceRange;
 import io.github.melswg.worldmind.core.memory.CompactionSource;
 import io.github.melswg.worldmind.core.memory.CurrentSituationVersion;
@@ -138,12 +139,13 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
     @Override
     public CompletionStage<JournaledObservation> appendObservation(CapturedPublicChatMessage observation) {
         Objects.requireNonNull(observation, "observation");
+        String redactedMessage = SecretRedactionPolicy.redact(observation.message());
         return submit(() -> {
             String sql = "INSERT INTO journal_messages(player_uuid, player_name, message_text, captured_at_epoch_millis, source, visibility, addressing_signal) VALUES (?, ?, ?, ?, ?, ?, ?)";
             try (PreparedStatement statement = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
                 statement.setString(1, observation.requester().playerId().toString());
                 statement.setString(2, observation.requester().playerName());
-                statement.setString(3, observation.message());
+                statement.setString(3, redactedMessage);
                 statement.setLong(4, observation.capturedAt().toEpochMilli());
                 statement.setString(5, JournalMessageSource.PUBLIC_CHAT.name());
                 statement.setString(6, JournalVisibility.PUBLIC.name());
@@ -152,7 +154,7 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
                 try (ResultSet keys = statement.getGeneratedKeys()) {
                     if (!keys.next()) throw new SQLException("SQLite did not return a journal sequence.");
                     return new JournaledObservation(
-                        worldIdentity, keys.getLong(1), observation.requester(), observation.message(), observation.capturedAt(),
+                        worldIdentity, keys.getLong(1), observation.requester(), redactedMessage, observation.capturedAt(),
                         JournalMessageSource.PUBLIC_CHAT, JournalVisibility.PUBLIC, observation.addressingSignal()
                     );
                 }

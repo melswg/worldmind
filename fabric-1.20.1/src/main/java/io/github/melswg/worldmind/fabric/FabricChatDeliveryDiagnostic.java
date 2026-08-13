@@ -14,7 +14,6 @@ record FabricChatDeliveryDiagnostic(
     long lastSequence,
     Optional<RefusalCode> refusalCode,
     Optional<AsyncWorkKind> workKind,
-    Optional<String> opaqueWorldIdentity,
     Optional<AsyncWorkSnapshot> queueSnapshot
 ) {
     FabricChatDeliveryDiagnostic {
@@ -24,7 +23,6 @@ record FabricChatDeliveryDiagnostic(
         }
         refusalCode = Objects.requireNonNull(refusalCode, "refusalCode");
         workKind = Objects.requireNonNull(workKind, "workKind");
-        opaqueWorldIdentity = Objects.requireNonNull(opaqueWorldIdentity, "opaqueWorldIdentity");
         queueSnapshot = Objects.requireNonNull(queueSnapshot, "queueSnapshot");
     }
 
@@ -34,7 +32,6 @@ record FabricChatDeliveryDiagnostic(
             firstSequence,
             lastSequence,
             Optional.of(Objects.requireNonNull(code, "code")),
-            Optional.empty(),
             Optional.empty(),
             Optional.empty()
         );
@@ -46,7 +43,7 @@ record FabricChatDeliveryDiagnostic(
         long lastSequence
     ) {
         return new FabricChatDeliveryDiagnostic(
-            kind, firstSequence, lastSequence, Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty()
+            kind, firstSequence, lastSequence, Optional.empty(), Optional.empty(), Optional.empty()
         );
     }
 
@@ -63,7 +60,6 @@ record FabricChatDeliveryDiagnostic(
             lastSequence,
             Optional.empty(),
             Optional.of(Objects.requireNonNull(workKind, "workKind")),
-            Optional.of(Objects.requireNonNull(worldIdentity, "worldIdentity").stableId()),
             Optional.of(Objects.requireNonNull(queueSnapshot, "queueSnapshot"))
         );
     }

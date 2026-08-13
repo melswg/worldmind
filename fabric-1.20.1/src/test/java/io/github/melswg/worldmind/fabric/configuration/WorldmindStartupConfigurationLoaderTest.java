@@ -413,7 +413,7 @@ class WorldmindStartupConfigurationLoaderTest {
         );
         DisabledWorldmindIntegration unsupported = assertInstanceOf(DisabledWorldmindIntegration.class, loader.load());
         assertDiagnostic(unsupported.diagnostics(), "global.provider.id", "custom-openai-compatible");
-        assertDiagnostic(unsupported.diagnostics(), "global.provider.secretReference", "env:NAME");
+        assertDiagnostic(unsupported.diagnostics(), "global.provider.secretReference", "provider-scheme:opaque-reference");
         assertEquals(2, secrets.resolutionCount());
 
         String missingEndpoint = Files.readString(configurationDirectory.resolve("worldmind.json"), StandardCharsets.UTF_8)
