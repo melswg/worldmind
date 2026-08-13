@@ -6,6 +6,11 @@ import io.github.melswg.worldmind.core.administration.AdministrationResultCode;
 import io.github.melswg.worldmind.core.administration.ChatBatchingStatus;
 import io.github.melswg.worldmind.core.administration.CompactionStatus;
 import io.github.melswg.worldmind.core.administration.ConfigurationValidationReport;
+import io.github.melswg.worldmind.core.administration.MemoryInspectionQuery;
+import io.github.melswg.worldmind.core.administration.MemoryInspectionRepository;
+import io.github.melswg.worldmind.core.administration.MemoryInspectionResult;
+import io.github.melswg.worldmind.core.administration.MemoryInspectionScope;
+import io.github.melswg.worldmind.core.administration.MemoryRecordType;
 import io.github.melswg.worldmind.core.administration.ProviderAvailability;
 import io.github.melswg.worldmind.core.administration.ReloadResult;
 import io.github.melswg.worldmind.core.administration.RuntimeLifecycleState;
@@ -224,6 +229,47 @@ final class WorldmindFabricServerLifecycle implements WorldmindAdministration {
     @Override
     public CompletionStage<ConfigurationValidationReport> validate() {
         return loadAsync().thenApply(ConfigurationValidationReport::fromIntegrationState);
+    }
+
+    @Override
+    public CompletionStage<MemoryInspectionResult> inspect(MemoryInspectionQuery query) {
+        Objects.requireNonNull(query, "query");
+        MemoryInspectionRepository repository;
+        synchronized (this) {
+            if (lifecycleState != RuntimeLifecycleState.RUNNING) {
+                return CompletableFuture.completedFuture(MemoryInspectionResult.of(AdministrationResultCode.LIFECYCLE_NOT_READY));
+            }
+            if (journal == null || storageHealth != StorageHealth.READY) {
+                return CompletableFuture.completedFuture(MemoryInspectionResult.of(AdministrationResultCode.STORAGE_NOT_READY));
+            }
+            repository = journal;
+        }
+        return repository.inspect(query).handle((page, failure) -> failure == null && page != null
+            ? MemoryInspectionResult.page(page) : MemoryInspectionResult.of(AdministrationResultCode.STORAGE_UNAVAILABLE));
+    }
+
+    @Override
+    public CompletionStage<MemoryInspectionResult> detail(
+        MemoryInspectionScope scope,
+        MemoryRecordType recordType,
+        String stableIdentity
+    ) {
+        Objects.requireNonNull(scope, "scope");
+        Objects.requireNonNull(recordType, "recordType");
+        MemoryInspectionRepository repository;
+        synchronized (this) {
+            if (lifecycleState != RuntimeLifecycleState.RUNNING) {
+                return CompletableFuture.completedFuture(MemoryInspectionResult.of(AdministrationResultCode.LIFECYCLE_NOT_READY));
+            }
+            if (journal == null || storageHealth != StorageHealth.READY) {
+                return CompletableFuture.completedFuture(MemoryInspectionResult.of(AdministrationResultCode.STORAGE_NOT_READY));
+            }
+            repository = journal;
+        }
+        return repository.detail(scope, recordType, stableIdentity).handle((record, failure) -> {
+            if (failure != null) return MemoryInspectionResult.of(AdministrationResultCode.STORAGE_UNAVAILABLE);
+            return record.map(MemoryInspectionResult::detail).orElseGet(() -> MemoryInspectionResult.of(AdministrationResultCode.NOT_FOUND));
+        });
     }
 
     @Override

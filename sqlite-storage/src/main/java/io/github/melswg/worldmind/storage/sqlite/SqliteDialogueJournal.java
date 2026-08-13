@@ -19,6 +19,14 @@ import io.github.melswg.worldmind.core.journal.JournaledBatch;
 import io.github.melswg.worldmind.core.journal.JournaledObservation;
 import io.github.melswg.worldmind.core.journal.ProviderAttemptOutcome;
 import io.github.melswg.worldmind.core.configuration.SecretRedactionPolicy;
+import io.github.melswg.worldmind.core.administration.MemoryAuditProvenance;
+import io.github.melswg.worldmind.core.administration.MemoryAuditRecord;
+import io.github.melswg.worldmind.core.administration.MemoryInspectionCursor;
+import io.github.melswg.worldmind.core.administration.MemoryInspectionPage;
+import io.github.melswg.worldmind.core.administration.MemoryInspectionQuery;
+import io.github.melswg.worldmind.core.administration.MemoryInspectionRepository;
+import io.github.melswg.worldmind.core.administration.MemoryInspectionScope;
+import io.github.melswg.worldmind.core.administration.MemoryRecordType;
 import io.github.melswg.worldmind.core.memory.JournalSequenceRange;
 import io.github.melswg.worldmind.core.memory.CompactionSource;
 import io.github.melswg.worldmind.core.memory.CurrentSituationVersion;
@@ -77,7 +85,8 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /** SQLite schema-v1 journal. Every JDBC action is serialized on one private worker thread. */
-public final class SqliteDialogueJournal implements DialogueJournal, WorldMemoryRepository, MemoryCompactionRepository {
+public final class SqliteDialogueJournal implements DialogueJournal, WorldMemoryRepository, MemoryCompactionRepository,
+    MemoryInspectionRepository {
     public static final String DATABASE_FILE_NAME = "worldmind.sqlite3";
     private static final int SCHEMA_VERSION = 1;
     private static final int RECENT_WORKING_OBSERVATIONS = 24;
@@ -218,6 +227,35 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
     @Override
     public CompletionStage<DialogueJournalSnapshot> readSnapshot() {
         return submit(() -> new DialogueJournalSnapshot(worldIdentity, readObservations(), readBatches(), readOutcomes()));
+    }
+
+    /**
+     * Fixed-size keyset read for the operator surface. It intentionally does
+     * not delegate to any historical snapshot method.
+     */
+    @Override
+    public CompletionStage<MemoryInspectionPage> inspect(MemoryInspectionQuery query) {
+        Objects.requireNonNull(query, "query");
+        return submit(() -> readInspection(query, null, 160, 16, MemoryInspectionQuery.PAGE_SIZE + 1));
+    }
+
+    @Override
+    public CompletionStage<Optional<MemoryAuditRecord>> detail(
+        MemoryInspectionScope scope,
+        MemoryRecordType recordType,
+        String stableIdentity
+    ) {
+        Objects.requireNonNull(scope, "scope");
+        Objects.requireNonNull(recordType, "recordType");
+        if (stableIdentity == null || stableIdentity.isBlank() || stableIdentity.length() > 160) {
+            return CompletableFuture.completedFuture(Optional.empty());
+        }
+        return submit(() -> {
+            MemoryInspectionPage page = readInspection(
+                new MemoryInspectionQuery(scope, recordType, Optional.empty()), stableIdentity, 1_024, 64, 1
+            );
+            return page.records().isEmpty() ? Optional.empty() : Optional.of(page.records().get(0));
+        });
     }
 
     @Override
@@ -622,6 +660,298 @@ public final class SqliteDialogueJournal implements DialogueJournal, WorldMemory
         });
         return closingFuture;
     }
+
+    private MemoryInspectionPage readInspection(
+        MemoryInspectionQuery query,
+        String exactIdentity,
+        int textLimit,
+        int membershipLimit,
+        int limit
+    ) throws SQLException {
+        InspectionSql selection = inspectionSelect(query.recordType(), query.scope());
+        StringBuilder sql = new StringBuilder("SELECT * FROM (").append(selection.sql()).append(") inspected WHERE 1 = 1");
+        if (exactIdentity != null) sql.append(" AND stable_identity = ?");
+        query.after().ifPresent(ignored -> sql.append(" AND (")
+            .append("last_sequence < ? OR (last_sequence = ? AND first_sequence < ?) OR ")
+            .append("(last_sequence = ? AND first_sequence = ? AND recorded_at_epoch_millis < ?) OR ")
+            .append("(last_sequence = ? AND first_sequence = ? AND recorded_at_epoch_millis = ? AND stable_identity > ?))"));
+        sql.append(" ORDER BY last_sequence DESC, first_sequence DESC, recorded_at_epoch_millis DESC, stable_identity ASC LIMIT ?");
+        List<MemoryAuditRecord> records = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement(sql.toString())) {
+            int parameter = 1;
+            for (String value : selection.parameters()) statement.setString(parameter++, value);
+            if (exactIdentity != null) statement.setString(parameter++, exactIdentity);
+            if (query.after().isPresent()) parameter = bindCursor(statement, parameter, query.after().orElseThrow());
+            statement.setInt(parameter, limit);
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) records.add(inspectionRecord(rows, query.recordType(), textLimit, membershipLimit));
+            }
+        }
+        if (records.size() <= MemoryInspectionQuery.PAGE_SIZE || limit <= MemoryInspectionQuery.PAGE_SIZE) {
+            return new MemoryInspectionPage(records, Optional.empty());
+        }
+        MemoryAuditRecord cursorRecord = records.get(MemoryInspectionQuery.PAGE_SIZE - 1);
+        records.remove(MemoryInspectionQuery.PAGE_SIZE);
+        MemoryInspectionCursor cursor = new MemoryInspectionCursor(query.recordType(), query.scope().fingerprint(),
+            cursorRecord.lastSequence(), cursorRecord.firstSequence(), cursorRecord.recordedAt().toEpochMilli(),
+            cursorRecord.stableIdentity());
+        return new MemoryInspectionPage(records, Optional.of(cursor));
+    }
+
+    private static int bindCursor(PreparedStatement statement, int parameter, MemoryInspectionCursor cursor) throws SQLException {
+        statement.setLong(parameter++, cursor.lastSequence());
+        statement.setLong(parameter++, cursor.lastSequence());
+        statement.setLong(parameter++, cursor.firstSequence());
+        statement.setLong(parameter++, cursor.lastSequence());
+        statement.setLong(parameter++, cursor.firstSequence());
+        statement.setLong(parameter++, cursor.recordedAtEpochMillis());
+        statement.setLong(parameter++, cursor.lastSequence());
+        statement.setLong(parameter++, cursor.firstSequence());
+        statement.setLong(parameter++, cursor.recordedAtEpochMillis());
+        statement.setString(parameter++, cursor.stableIdentity());
+        return parameter;
+    }
+
+    private InspectionSql inspectionSelect(MemoryRecordType type, MemoryInspectionScope scope) {
+        return switch (type) {
+            case OBSERVATION -> observationInspection(scope);
+            case BATCH -> batchInspection(scope);
+            case OUTCOME -> outcomeInspection(scope, false);
+            case REPLY -> outcomeInspection(scope, true);
+            case FACT -> storedMemoryInspection(scope, false);
+            case RELATIONSHIP -> storedMemoryInspection(scope, true);
+            case EVENT -> eventInspection(scope);
+            case CURRENT_SITUATION -> versionInspection(scope, true);
+            case SUMMARY -> versionInspection(scope, false);
+        };
+    }
+
+    private InspectionSql observationInspection(MemoryInspectionScope scope) {
+        SqlFragment filter = scope.kind() == MemoryInspectionScope.Kind.WORLD ? SqlFragment.empty()
+            : new SqlFragment(" WHERE m.player_uuid = ?", List.of(scope.playerId().orElseThrow().toString()));
+        return new InspectionSql("SELECT 'observation:' || m.sequence AS stable_identity, m.sequence AS first_sequence, "
+            + "m.sequence AS last_sequence, 'WORLD' AS scope_type, NULL AS scope_player_uuid, m.visibility, m.source AS source_type, "
+            + "m.captured_at_epoch_millis AS source_at_epoch_millis, m.captured_at_epoch_millis AS recorded_at_epoch_millis, "
+            + "NULL AS confidence, NULL AS importance, NULL AS state, NULL AS relationship_subject_uuid, NULL AS version_number, "
+            + "NULL AS latest, NULL AS superseded_by, m.player_uuid AS actor_player_uuid, m.message_text AS content, "
+            + "'OBSERVATION' AS origin_kind, CAST(m.sequence AS TEXT) AS origin_id FROM journal_messages m" + filter.sql(), filter.parameters());
+    }
+
+    private InspectionSql batchInspection(MemoryInspectionScope scope) {
+        SqlFragment filter = batchScope(scope, "b.batch_id", "b");
+        return new InspectionSql("SELECT 'batch:' || b.batch_id AS stable_identity, b.first_sequence, b.last_sequence, "
+            + "'WORLD' AS scope_type, NULL AS scope_player_uuid, 'PUBLIC' AS visibility, 'SEALED_BATCH' AS source_type, "
+            + "b.sealed_at_epoch_millis AS source_at_epoch_millis, b.sealed_at_epoch_millis AS recorded_at_epoch_millis, "
+            + "NULL AS confidence, NULL AS importance, b.seal_reason AS state, NULL AS relationship_subject_uuid, "
+            + "NULL AS version_number, NULL AS latest, NULL AS superseded_by, NULL AS actor_player_uuid, '' AS content, "
+            + "'BATCH' AS origin_kind, b.batch_id AS origin_id FROM journal_batches b" + filter.sql(), filter.parameters());
+    }
+
+    private InspectionSql outcomeInspection(MemoryInspectionScope scope, boolean reply) {
+        SqlFragment filter = batchScope(scope, "b.batch_id", "b");
+        String where = filter.sql().isEmpty() ? (reply ? " WHERE o.delivered_response IS NOT NULL" : "")
+            : filter.sql() + (reply ? " AND o.delivered_response IS NOT NULL" : "");
+        String prefix = reply ? "reply:" : "outcome:";
+        String source = reply ? "WORLDMIND_DELIVERY" : "BATCH_OUTCOME";
+        String content = reply ? "COALESCE(o.delivered_response, '')" : "''";
+        String state = reply ? "o.delivery_status" : "o.provider_attempt_outcome || ':' || COALESCE(o.decision, o.refusal_code, 'NONE')";
+        return new InspectionSql("SELECT '" + prefix + "' || b.batch_id AS stable_identity, b.first_sequence, b.last_sequence, "
+            + "'WORLD' AS scope_type, NULL AS scope_player_uuid, 'PUBLIC' AS visibility, '" + source + "' AS source_type, "
+            + "o.completed_at_epoch_millis AS source_at_epoch_millis, o.completed_at_epoch_millis AS recorded_at_epoch_millis, "
+            + "NULL AS confidence, NULL AS importance, " + state + " AS state, NULL AS relationship_subject_uuid, "
+            + "NULL AS version_number, NULL AS latest, NULL AS superseded_by, NULL AS actor_player_uuid, " + content + " AS content, "
+            + "'BATCH' AS origin_kind, b.batch_id AS origin_id FROM journal_outcomes o JOIN journal_batches b ON b.batch_id = o.batch_id"
+            + where, filter.parameters());
+    }
+
+    private InspectionSql storedMemoryInspection(MemoryInspectionScope scope, boolean relationship) {
+        SqlFragment filter = recordScope(scope, "r", "r.source_batch_id");
+        String type = relationship ? "RELATIONSHIP" : "FACT";
+        String prefix = relationship ? "relationship:" : "fact:";
+        return new InspectionSql("SELECT '" + prefix + "' || r.record_id AS stable_identity, r.first_sequence, r.last_sequence, "
+            + "r.scope_type, r.scope_player_uuid, r.visibility, 'MEMORY_EXTRACTION' AS source_type, "
+            + "r.source_timestamp_epoch_millis AS source_at_epoch_millis, r.recorded_at_epoch_millis AS recorded_at_epoch_millis, "
+            + "r.confidence, r.importance, r.record_state AS state, r.relationship_subject_uuid, NULL AS version_number, "
+            + "NULL AS latest, NULL AS superseded_by, NULL AS actor_player_uuid, r.content, 'RECORD' AS origin_kind, "
+            + "r.source_batch_id AS origin_id FROM memory_records r WHERE r.record_type = '" + type + "'"
+            + filter.andClause(), filter.parameters());
+    }
+
+    private InspectionSql eventInspection(MemoryInspectionScope scope) {
+        SqlFragment filter = derivedScope(scope, "e", "EVENT", "e.event_id");
+        return new InspectionSql("SELECT 'event:' || e.event_id AS stable_identity, e.first_sequence, e.last_sequence, e.scope_type, "
+            + "e.scope_player_uuid, e.visibility, 'COMPACTION' AS source_type, e.source_timestamp_epoch_millis AS source_at_epoch_millis, "
+            + "e.recorded_at_epoch_millis AS recorded_at_epoch_millis, e.confidence, e.importance, 'IMMUTABLE' AS state, "
+            + "NULL AS relationship_subject_uuid, NULL AS version_number, NULL AS latest, NULL AS superseded_by, NULL AS actor_player_uuid, "
+            + "e.content, 'DERIVED:EVENT' AS origin_kind, e.event_id AS origin_id FROM memory_events e" + filter.sql(), filter.parameters());
+    }
+
+    private InspectionSql versionInspection(MemoryInspectionScope scope, boolean situation) {
+        String table = situation ? "memory_current_situation_versions" : "memory_summary_versions";
+        String alias = situation ? "s" : "v";
+        String id = situation ? "situation_version_id" : "summary_version_id";
+        String series = situation ? "situation_series_id" : "summary_series_id";
+        String kind = situation ? "CURRENT_SITUATION" : "SUMMARY";
+        String prefix = situation ? "situation:" : "summary:";
+        SqlFragment filter = derivedScope(scope, alias, kind, alias + "." + id);
+        return new InspectionSql("SELECT '" + prefix + "' || " + alias + "." + id + " AS stable_identity, " + alias + ".first_sequence, "
+            + alias + ".last_sequence, " + alias + ".scope_type, " + alias + ".scope_player_uuid, " + alias + ".visibility, "
+            + "'COMPACTION' AS source_type, " + alias + ".source_timestamp_epoch_millis AS source_at_epoch_millis, "
+            + alias + ".recorded_at_epoch_millis AS recorded_at_epoch_millis, " + alias + ".confidence, " + alias + ".importance, "
+            + "'VERSIONED' AS state, NULL AS relationship_subject_uuid, " + alias + ".version_number, "
+            + "CASE WHEN NOT EXISTS (SELECT 1 FROM " + table + " newer WHERE newer." + series + " = " + alias + "." + series
+            + " AND newer.version_number > " + alias + ".version_number) THEN 1 ELSE 0 END AS latest, "
+            + "(SELECT '" + prefix + "' || newer." + id + " FROM " + table + " newer WHERE newer." + series + " = " + alias + "." + series
+            + " AND newer.version_number > " + alias + ".version_number ORDER BY newer.version_number LIMIT 1) AS superseded_by, "
+            + "NULL AS actor_player_uuid, " + alias + ".content, 'DERIVED:" + kind + "' AS origin_kind, " + alias + "." + id
+            + " AS origin_id FROM " + table + " " + alias + filter.sql(), filter.parameters());
+    }
+
+    private static SqlFragment batchScope(MemoryInspectionScope scope, String batchId, String alias) {
+        if (scope.kind() == MemoryInspectionScope.Kind.WORLD) return SqlFragment.empty();
+        String player = scope.playerId().orElseThrow().toString();
+        return new SqlFragment(" WHERE EXISTS (SELECT 1 FROM journal_batch_messages bm JOIN journal_messages m "
+            + "ON m.sequence = bm.message_sequence WHERE bm.batch_id = " + batchId + " AND m.player_uuid = ?) "
+            + "AND NOT EXISTS (SELECT 1 FROM journal_batch_messages bm JOIN journal_messages m ON m.sequence = bm.message_sequence "
+            + "WHERE bm.batch_id = " + batchId + " AND m.player_uuid <> ?)", List.of(player, player));
+    }
+
+    private static SqlFragment recordScope(MemoryInspectionScope scope, String alias, String sourceBatchId) {
+        if (scope.kind() == MemoryInspectionScope.Kind.WORLD) return SqlFragment.empty();
+        String player = scope.playerId().orElseThrow().toString();
+        return new SqlFragment(" AND " + alias + ".scope_type = 'PLAYER' AND " + alias + ".scope_player_uuid = ? "
+            + "AND EXISTS (SELECT 1 FROM journal_batch_messages bm JOIN journal_messages m ON m.sequence = bm.message_sequence "
+            + "WHERE bm.batch_id = " + sourceBatchId + " AND m.player_uuid = ?) "
+            + "AND NOT EXISTS (SELECT 1 FROM journal_batch_messages bm JOIN journal_messages m ON m.sequence = bm.message_sequence "
+            + "WHERE bm.batch_id = " + sourceBatchId + " AND m.player_uuid <> ?)", List.of(player, player, player));
+    }
+
+    private static SqlFragment derivedScope(MemoryInspectionScope scope, String alias, String kind, String id) {
+        if (scope.kind() == MemoryInspectionScope.Kind.WORLD) return SqlFragment.empty();
+        String player = scope.playerId().orElseThrow().toString();
+        return new SqlFragment(" WHERE " + alias + ".scope_type = 'PLAYER' AND " + alias + ".scope_player_uuid = ? "
+            + "AND EXISTS (SELECT 1 FROM memory_derived_sources ds JOIN journal_batch_messages bm ON bm.batch_id = ds.batch_id "
+            + "JOIN journal_messages m ON m.sequence = bm.message_sequence WHERE ds.record_kind = '" + kind
+            + "' AND ds.record_id = " + id + " AND m.player_uuid = ?) "
+            + "AND NOT EXISTS (SELECT 1 FROM memory_derived_sources ds JOIN journal_batch_messages bm ON bm.batch_id = ds.batch_id "
+            + "JOIN journal_messages m ON m.sequence = bm.message_sequence WHERE ds.record_kind = '" + kind
+            + "' AND ds.record_id = " + id + " AND m.player_uuid <> ?)", List.of(player, player, player));
+    }
+
+    private MemoryAuditRecord inspectionRecord(ResultSet row, MemoryRecordType recordType, int textLimit, int membershipLimit)
+        throws SQLException {
+        long first = row.getLong("first_sequence");
+        long last = row.getLong("last_sequence");
+        String originKind = row.getString("origin_kind");
+        String originId = row.getString("origin_id");
+        List<String> batches = inspectionBatchIds(originKind, originId);
+        Membership membership = "BATCH".equals(originKind) ? membership(originId, membershipLimit) : Membership.empty();
+        BoundedText content = boundedInspectionText(row.getString("content"), textLimit);
+        return new MemoryAuditRecord(
+            row.getString("stable_identity"), recordType, first, last, inspectionScope(row), row.getString("visibility"),
+            row.getString("source_type"), Instant.ofEpochMilli(row.getLong("source_at_epoch_millis")),
+            Instant.ofEpochMilli(row.getLong("recorded_at_epoch_millis")), optionalDouble(row, "confidence"), optionalDouble(row, "importance"),
+            Optional.ofNullable(row.getString("state")), optionalUuid(row, "relationship_subject_uuid"), optionalInt(row, "version_number"),
+            optionalBoolean(row, "latest"), Optional.ofNullable(row.getString("superseded_by")),
+            new MemoryAuditProvenance(first, last, batches), optionalUuid(row, "actor_player_uuid"), content.text(), content.truncated(),
+            membership.sequences(), membership.truncated()
+        );
+    }
+
+    private MemoryInspectionScope inspectionScope(ResultSet row) throws SQLException {
+        return "PLAYER".equals(row.getString("scope_type"))
+            ? MemoryInspectionScope.player(UUID.fromString(row.getString("scope_player_uuid"))) : MemoryInspectionScope.world();
+    }
+
+    private List<String> inspectionBatchIds(String originKind, String originId) throws SQLException {
+        if ("BATCH".equals(originKind) || "RECORD".equals(originKind)) return List.of(originId);
+        if ("OBSERVATION".equals(originKind)) {
+            try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT batch_id FROM journal_batch_messages WHERE message_sequence = ? ORDER BY batch_id"
+            )) {
+                statement.setLong(1, Long.parseLong(originId));
+                try (ResultSet rows = statement.executeQuery()) {
+                    List<String> result = new ArrayList<>();
+                    while (rows.next()) result.add(rows.getString(1));
+                    return List.copyOf(result);
+                }
+            }
+        }
+        String[] parts = originKind.split(":", -1);
+        try (PreparedStatement statement = connection.prepareStatement(
+            "SELECT batch_id FROM memory_derived_sources WHERE record_kind = ? AND record_id = ? ORDER BY ordinal"
+        )) {
+            statement.setString(1, parts[1]); statement.setString(2, originId);
+            try (ResultSet rows = statement.executeQuery()) {
+                List<String> result = new ArrayList<>();
+                while (rows.next()) result.add(rows.getString(1));
+                return List.copyOf(result);
+            }
+        }
+    }
+
+    private Membership membership(String batchId, int maximum) throws SQLException {
+        List<Long> sequences = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement(
+            "SELECT message_sequence FROM journal_batch_messages WHERE batch_id = ? ORDER BY ordinal LIMIT ?"
+        )) {
+            statement.setString(1, batchId); statement.setInt(2, maximum + 1);
+            try (ResultSet rows = statement.executeQuery()) { while (rows.next()) sequences.add(rows.getLong(1)); }
+        }
+        boolean truncated = sequences.size() > maximum;
+        return new Membership(truncated ? List.copyOf(sequences.subList(0, maximum)) : List.copyOf(sequences), truncated);
+    }
+
+    private static BoundedText boundedInspectionText(String content, int maximum) {
+        String value = sanitizeInspectionText(SecretRedactionPolicy.redact(content == null ? "" : content));
+        int lines = 0;
+        int end = 0;
+        for (int offset = 0, points = 0; offset < value.length() && points < maximum; ) {
+            int point = value.codePointAt(offset);
+            if (point == '\n' && ++lines >= 12) break;
+            end = offset + Character.charCount(point); offset = end; points++;
+        }
+        boolean truncated = end < value.length();
+        return new BoundedText(truncated ? value.substring(0, end) : value, truncated);
+    }
+
+    private static String sanitizeInspectionText(String value) {
+        StringBuilder result = new StringBuilder(value.length());
+        value.codePoints().filter(point -> point == '\n' || (point >= 0x20 && point != 0x7F && point != 0x202A && point != 0x202B
+            && point != 0x202D && point != 0x202E && point != 0x2066 && point != 0x2067 && point != 0x2068 && point != 0x2069))
+            .forEach(result::appendCodePoint);
+        return result.toString();
+    }
+
+    private static Optional<Double> optionalDouble(ResultSet row, String column) throws SQLException {
+        Object value = row.getObject(column);
+        return value == null ? Optional.empty() : Optional.of(row.getDouble(column));
+    }
+
+    private static Optional<Integer> optionalInt(ResultSet row, String column) throws SQLException {
+        Object value = row.getObject(column);
+        return value == null ? Optional.empty() : Optional.of(row.getInt(column));
+    }
+
+    private static Optional<Boolean> optionalBoolean(ResultSet row, String column) throws SQLException {
+        Object value = row.getObject(column);
+        return value == null ? Optional.empty() : Optional.of(row.getInt(column) != 0);
+    }
+
+    private static Optional<UUID> optionalUuid(ResultSet row, String column) throws SQLException {
+        String value = row.getString(column);
+        return value == null ? Optional.empty() : Optional.of(UUID.fromString(value));
+    }
+
+    private record InspectionSql(String sql, List<String> parameters) { }
+    private record SqlFragment(String sql, List<String> parameters) {
+        static SqlFragment empty() { return new SqlFragment("", List.of()); }
+        String andClause() { return sql.isEmpty() ? "" : sql; }
+    }
+    private record Membership(List<Long> sequences, boolean truncated) {
+        static Membership empty() { return new Membership(List.of(), false); }
+    }
+    private record BoundedText(String text, boolean truncated) { }
 
     private List<JournaledObservation> readObservations() throws SQLException {
         List<JournaledObservation> observations = new ArrayList<>();
