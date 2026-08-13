@@ -60,6 +60,7 @@ file.
     "secretReference": "env:WORLDMIND_API_KEY",
     "timeouts": {"connectMillis": 5000, "responseCompletionMillis": 30000},
     "retry": {"maximumAttempts": 3, "initialBackoffMillis": 250, "maximumBackoffMillis": 4000, "jitterRatio": 0.2},
+    "circuitBreaker": {"failureThreshold": 5, "cooldownMillis": 30000},
     "generation": {"temperature": 0.4, "maxOutputTokens": 120}
   }
 }
@@ -111,6 +112,10 @@ required except for local loopback HTTP used in tests or local development.
 
 `retry` is required in v1. Only connection loss, timeouts, HTTP 429, and 5xx
 responses retry; the first attempt is included in `maximumAttempts`.
+
+`circuitBreaker` is required in v1. After the configured count of qualifying
+terminal provider failures, Worldmind stops HTTP calls for `cooldownMillis` and
+allows only one recovery probe.
 
 ## Prompt and chat safety
 

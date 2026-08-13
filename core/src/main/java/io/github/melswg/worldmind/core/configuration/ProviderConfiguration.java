@@ -10,7 +10,8 @@ public record ProviderConfiguration(
     GenerationParameters generationParameters,
     ExternalSecretReference secretReference,
     ProviderTimeoutConfiguration timeouts,
-    ProviderRetryConfiguration retry
+    ProviderRetryConfiguration retry,
+    ProviderCircuitBreakerConfiguration circuitBreaker
 ) {
     public ProviderConfiguration {
         providerId = requireText(providerId, "providerId");
@@ -20,6 +21,7 @@ public record ProviderConfiguration(
         Objects.requireNonNull(secretReference, "secretReference");
         Objects.requireNonNull(timeouts, "timeouts");
         Objects.requireNonNull(retry, "retry");
+        Objects.requireNonNull(circuitBreaker, "circuitBreaker");
     }
 
     /** Compatibility constructor for programmatic integrations predating configurable timeouts. */
@@ -30,12 +32,17 @@ public record ProviderConfiguration(
         GenerationParameters generationParameters,
         ExternalSecretReference secretReference
     ) {
-        this(providerId, endpoint, model, generationParameters, secretReference, ProviderTimeoutConfiguration.DEFAULT, ProviderRetryConfiguration.DEFAULT);
+        this(providerId, endpoint, model, generationParameters, secretReference, ProviderTimeoutConfiguration.DEFAULT, ProviderRetryConfiguration.DEFAULT, ProviderCircuitBreakerConfiguration.DEFAULT);
     }
 
     public ProviderConfiguration(String providerId, ProviderEndpoint endpoint, String model, GenerationParameters generationParameters,
                                  ExternalSecretReference secretReference, ProviderTimeoutConfiguration timeouts) {
-        this(providerId, endpoint, model, generationParameters, secretReference, timeouts, ProviderRetryConfiguration.DEFAULT);
+        this(providerId, endpoint, model, generationParameters, secretReference, timeouts, ProviderRetryConfiguration.DEFAULT, ProviderCircuitBreakerConfiguration.DEFAULT);
+    }
+
+    public ProviderConfiguration(String providerId, ProviderEndpoint endpoint, String model, GenerationParameters generationParameters,
+                                 ExternalSecretReference secretReference, ProviderTimeoutConfiguration timeouts, ProviderRetryConfiguration retry) {
+        this(providerId, endpoint, model, generationParameters, secretReference, timeouts, retry, ProviderCircuitBreakerConfiguration.DEFAULT);
     }
 
     private static String requireText(String value, String name) {

@@ -20,6 +20,8 @@ import io.github.melswg.worldmind.core.conversation.ProviderCapabilities;
 import io.github.melswg.worldmind.core.conversation.RefusalCode;
 import io.github.melswg.worldmind.core.conversation.RetryingLanguageModel;
 import io.github.melswg.worldmind.core.conversation.JitterSource;
+import io.github.melswg.worldmind.core.conversation.CircuitBreakingLanguageModel;
+import io.github.melswg.worldmind.core.conversation.ProviderCircuitBreaker;
 import io.github.melswg.worldmind.core.conversation.ServerRequester;
 import io.github.melswg.worldmind.core.conversation.SealedChatBatch;
 import io.github.melswg.worldmind.core.conversation.UntrustedContext;
@@ -93,11 +95,18 @@ final class FabricChatObservationRuntime implements AutoCloseable {
                 serverScheduler,
                 serverScheduler,
                 new ConversationApplicationService(
-                    new RetryingLanguageModel(
+                    new CircuitBreakingLanguageModel(
+                        new RetryingLanguageModel(
+                            languageModel,
+                            configuration.globalConfiguration().provider().retry(),
+                            delayedScheduler,
+                            JitterSource.random()
+                        ),
                         languageModel,
-                        configuration.globalConfiguration().provider().retry(),
-                        delayedScheduler,
-                        JitterSource.random()
+                        new ProviderCircuitBreaker(
+                            configuration.globalConfiguration().provider().circuitBreaker(),
+                            Clock.systemUTC()
+                        )
                     ),
                     serverScheduler,
                     journal instanceof WorldMemoryRepository memoryRepository

@@ -467,6 +467,7 @@ class WorldmindStartupConfigurationLoaderTest {
                 "secretReference": "%s",
                 "timeouts": {"connectMillis": 5000, "responseCompletionMillis": 30000},
                 "retry": {"maximumAttempts": 3, "initialBackoffMillis": 250, "maximumBackoffMillis": 4000, "jitterRatio": 0.2},
+                "circuitBreaker": {"failureThreshold": 5, "cooldownMillis": 30000},
                 "generation": %s
               }
             }
