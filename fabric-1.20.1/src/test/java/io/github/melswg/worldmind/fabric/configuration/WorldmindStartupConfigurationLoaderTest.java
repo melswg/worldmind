@@ -465,6 +465,7 @@ class WorldmindStartupConfigurationLoaderTest {
                 "endpoint": "%s",
                 "model": "example-model",
                 "secretReference": "%s",
+                "timeouts": {"connectMillis": 5000, "responseCompletionMillis": 30000},
                 "generation": %s
               }
             }

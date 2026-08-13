@@ -16,6 +16,7 @@ import io.github.melswg.worldmind.core.configuration.IntegrationDisableReason;
 import io.github.melswg.worldmind.core.configuration.LoreMaterial;
 import io.github.melswg.worldmind.core.configuration.ProviderConfiguration;
 import io.github.melswg.worldmind.core.configuration.ProviderEndpoint;
+import io.github.melswg.worldmind.core.configuration.ProviderTimeoutConfiguration;
 import io.github.melswg.worldmind.core.configuration.RequestQueueConfiguration;
 import io.github.melswg.worldmind.core.configuration.ResponseLengthLimit;
 import io.github.melswg.worldmind.core.configuration.SecretAvailability;
@@ -66,8 +67,9 @@ public final class WorldmindStartupConfigurationLoader {
         "maxEstimatedInputCharacters"
     );
     private static final Set<String> REQUEST_QUEUE_FIELDS = Set.of("capacity", "maxConcurrency");
-    private static final Set<String> PROVIDER_FIELDS = Set.of("id", "endpoint", "model", "generation", "secretReference");
+    private static final Set<String> PROVIDER_FIELDS = Set.of("id", "endpoint", "model", "generation", "secretReference", "timeouts");
     private static final Set<String> GENERATION_FIELDS = Set.of("temperature", "topP", "maxOutputTokens");
+    private static final Set<String> TIMEOUT_FIELDS = Set.of("connectMillis", "responseCompletionMillis");
     private static final Set<String> PROFILE_FIELDS = Set.of(
         "schemaVersion",
         "characterName",
@@ -116,7 +118,8 @@ public final class WorldmindStartupConfigurationLoader {
                 global.endpoint(),
                 global.model(),
                 new GenerationParameters(global.temperature(), global.topP(), global.maxOutputTokens()),
-                new ExternalSecretReference(global.secretReference())
+                new ExternalSecretReference(global.secretReference()),
+                global.timeouts()
             ),
             global.chatBatching(),
             global.requestQueue()
@@ -201,6 +204,9 @@ public final class WorldmindStartupConfigurationLoader {
         validateProviderId(providerId, diagnostics);
         validateSecretReference(secretReference, diagnostics);
 
+        JsonObject timeouts = requiredObject(provider, "timeouts", "global.provider", diagnostics);
+        ProviderTimeoutConfiguration timeoutConfiguration = parseTimeouts(timeouts, diagnostics);
+
         JsonObject generation = requiredObject(provider, "generation", "global.provider", diagnostics);
         if (generation == null) {
             return null;
@@ -217,7 +223,7 @@ public final class WorldmindStartupConfigurationLoader {
         validateGenerationParameters(temperature, topP, maxOutputTokens, diagnostics);
 
         if (schemaVersion == null || enabled == null || activeProfile == null || batchingConfiguration == null || requestQueueConfiguration == null
-            || providerId == null || endpoint == null || model == null || secretReference == null) {
+            || providerId == null || endpoint == null || model == null || secretReference == null || timeoutConfiguration == null) {
             return null;
         }
         return new ParsedGlobal(
@@ -231,9 +237,24 @@ public final class WorldmindStartupConfigurationLoader {
             topP,
             maxOutputTokens,
             secretReference,
+            timeoutConfiguration,
             batchingConfiguration,
             requestQueueConfiguration
         );
+    }
+
+    private ProviderTimeoutConfiguration parseTimeouts(JsonObject timeouts, List<ConfigurationDiagnostic> diagnostics) {
+        if (timeouts == null) return null;
+        rejectUnknownFields(timeouts, "global.provider.timeouts", TIMEOUT_FIELDS, diagnostics);
+        Integer connect = requiredInteger(timeouts, "connectMillis", "global.provider.timeouts", diagnostics);
+        Integer completion = requiredInteger(timeouts, "responseCompletionMillis", "global.provider.timeouts", diagnostics);
+        if (connect == null || completion == null) return null;
+        try {
+            return new ProviderTimeoutConfiguration(connect, completion);
+        } catch (IllegalArgumentException invalid) {
+            diagnostic(diagnostics, "global.provider.timeouts", "must use positive bounded values with responseCompletionMillis at least connectMillis.");
+            return null;
+        }
     }
 
     private RequestQueueConfiguration parseRequestQueue(JsonObject requestQueue, List<ConfigurationDiagnostic> diagnostics) {
@@ -750,6 +771,7 @@ public final class WorldmindStartupConfigurationLoader {
         Optional<Double> topP,
         Optional<Integer> maxOutputTokens,
         String secretReference,
+        ProviderTimeoutConfiguration timeouts,
         ChatBatchingConfiguration chatBatching,
         RequestQueueConfiguration requestQueue
     ) {

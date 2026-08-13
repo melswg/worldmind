@@ -111,6 +111,10 @@ public final class ConversationApplicationService {
             return new ConversationRefusal(refusal.code());
         }
 
+        if (result instanceof ProviderFailure failureResult) {
+            return new ConversationRefusal(toRefusal(failureResult.kind()));
+        }
+
         ProviderResponse response = (ProviderResponse) result;
         ConversationOutcome outcome = ParticipationProtocol.decode(
             response.text(),
@@ -125,5 +129,19 @@ public final class ConversationApplicationService {
     private boolean containsExactAddress(NormalizedServerRequest request) {
         return request.chatBatch().messages().stream()
             .anyMatch(message -> message.addressingSignal() == AddressingSignal.EXACT);
+    }
+
+    private RefusalCode toRefusal(ProviderFailureKind failure) {
+        return switch (failure) {
+            case CONNECTION_FAILURE -> RefusalCode.PROVIDER_CONNECTION_FAILURE;
+            case TIMEOUT -> RefusalCode.PROVIDER_TIMEOUT;
+            case HTTP_RATE_LIMITED -> RefusalCode.PROVIDER_RATE_LIMITED;
+            case HTTP_SERVER_ERROR -> RefusalCode.PROVIDER_SERVER_ERROR;
+            case HTTP_AUTHENTICATION -> RefusalCode.PROVIDER_AUTHENTICATION_FAILURE;
+            case HTTP_NON_RETRYABLE -> RefusalCode.PROVIDER_HTTP_FAILURE;
+            case MALFORMED_JSON -> RefusalCode.MALFORMED_PROVIDER_JSON;
+            case EMPTY_CONTENT -> RefusalCode.EMPTY_RESPONSE;
+            case OVERSIZED_CONTENT -> RefusalCode.OVERSIZED_PROVIDER_CONTENT;
+        };
     }
 }

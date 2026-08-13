@@ -135,9 +135,9 @@ class CustomOpenAiCompatibleLanguageModelTest {
     @Test
     void mapsBlankAndInvalidSuccessPayloadsToTypedConversationFailures() throws Exception {
         assertConversationRefusal("{\"choices\":[{\"message\":{\"content\":\"  \"}}]}", RefusalCode.EMPTY_RESPONSE);
-        assertConversationRefusal("not-json", RefusalCode.INVALID_PROVIDER_RESPONSE);
-        assertConversationRefusal("{\"choices\":[]}", RefusalCode.INVALID_PROVIDER_RESPONSE);
-        assertConversationRefusal("{\"choices\":[{\"message\":{\"content\":7}}]}", RefusalCode.INVALID_PROVIDER_RESPONSE);
+        assertConversationRefusal("not-json", RefusalCode.MALFORMED_PROVIDER_JSON);
+        assertConversationRefusal("{\"choices\":[]}", RefusalCode.MALFORMED_PROVIDER_JSON);
+        assertConversationRefusal("{\"choices\":[{\"message\":{\"content\":7}}]}", RefusalCode.MALFORMED_PROVIDER_JSON);
     }
 
     @Test
@@ -161,7 +161,7 @@ class CustomOpenAiCompatibleLanguageModelTest {
             scenario.serverScheduler().runUntilIdle();
 
             ConversationRefusal refusal = assertInstanceOf(ConversationRefusal.class, outcome.toCompletableFuture().join());
-            assertEquals(RefusalCode.PROVIDER_UNAVAILABLE, refusal.code());
+            assertEquals(RefusalCode.PROVIDER_RATE_LIMITED, refusal.code());
         }
 
         try (FakeOpenAiCompatibleHttpServer server = new FakeOpenAiCompatibleHttpServer()) {

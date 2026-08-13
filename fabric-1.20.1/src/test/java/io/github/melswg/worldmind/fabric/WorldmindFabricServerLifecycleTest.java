@@ -92,6 +92,7 @@ class WorldmindFabricServerLifecycleTest {
                 "endpoint": "https://api.example.invalid/v1/chat/completions",
                 "model": "example-model",
                 "secretReference": "env:WORLDMIND_TEST_KEY",
+                "timeouts": {"connectMillis": 5000, "responseCompletionMillis": 30000},
                 "generation": {}
               }
             }

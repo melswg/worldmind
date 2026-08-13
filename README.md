@@ -58,6 +58,7 @@ file.
     "endpoint": "https://provider.example/v1/chat/completions",
     "model": "example-model",
     "secretReference": "env:WORLDMIND_API_KEY",
+    "timeouts": {"connectMillis": 5000, "responseCompletionMillis": 30000},
     "generation": {"temperature": 0.4, "maxOutputTokens": 120}
   }
 }
@@ -103,6 +104,9 @@ and emits field-specific diagnostics; Minecraft keeps running. The profile,
 provider request, diagnostics, and example configuration never contain its
 value. The configured endpoint is the full Chat Completions URI; HTTPS is
 required except for local loopback HTTP used in tests or local development.
+
+`timeouts` is required in v1. `connectMillis` bounds a new TCP/TLS connection;
+`responseCompletionMillis` bounds the complete HTTP exchange and response body.
 
 ## Prompt and chat safety
 
