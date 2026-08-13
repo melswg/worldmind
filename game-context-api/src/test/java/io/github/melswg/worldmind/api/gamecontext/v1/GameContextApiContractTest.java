@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.Arrays;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 class GameContextApiContractTest {
@@ -48,5 +49,21 @@ class GameContextApiContractTest {
         assertEquals(1, result.entries().size());
         assertThrows(UnsupportedOperationException.class, () -> result.entries().add(new GameContextEntry("x", "y")));
         assertFalse(result.entries().isEmpty());
+    }
+
+    @Test
+    void publicSignaturesNeverExposeWorldmindImplementationPackages() {
+        List<Class<?>> publicApi = List.of(
+            GameContextApi.class, WorldmindGameContextEntrypoint.class, GameContextRegistrar.class,
+            GameContextRegistration.class, GameContextProvider.class, GameContextSource.class,
+            GameContextServerContext.class, GameContextWorldContext.class, GameContextReloadContext.class,
+            GameContextRequest.class, GameContextEntry.class, GameContextResult.class, GameContextLimits.class
+        );
+        assertTrue(publicApi.stream().flatMap(type -> Arrays.stream(type.getMethods()))
+            .flatMap(method -> java.util.stream.Stream.concat(
+                java.util.stream.Stream.of(method.getReturnType()), Arrays.stream(method.getParameterTypes())
+            ))
+            .map(Class::getName)
+            .noneMatch(name -> name.contains(".core.") || name.contains(".fabric.") || name.contains(".gamecontext.internal.")));
     }
 }

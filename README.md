@@ -29,9 +29,28 @@ server, so the same path can serve dedicated servers and single-player worlds.
 - `core` — Minecraft-independent authoritative bootstrap, public-chat batching,
   participation-decision protocol, and future domain code.
 - `fabric-1.20.1` — Fabric lifecycle adapter and the distributable mod artifact.
+- `game-context-api` — versioned, dependency-free public API for external
+  Fabric game-context providers.
+- `game-context-runtime` — Worldmind-private bounded invocation and lifecycle
+  runtime; it is packaged inside the Worldmind Fabric artifact, not supported
+  as an external API.
 - `testkit` — deterministic acceptance seam with a fake LLM, controlled clock,
   controllable server scheduler, and synthetic vanilla game context. It records
   stable provider requests and sealed chat batches without a Minecraft client.
+
+## External game-context providers
+
+External Fabric mods can contribute small structured public context through the
+versioned `game-context-api` artifact and the
+`worldmind-game-context-v1` entrypoint. Worldmind invokes this API on bounded
+daemon workers, not on the Minecraft server thread. Returned values are always
+source-attributed untrusted `CURRENT_GAME_CONTEXT`; they cannot change trusted
+rules, persona, participation, memory, transport, or delivery.
+
+See [the v0.1 API guide](docs/game-context-api-v0.1.md) and the independently
+compilable [external-mod example](examples/game-context-provider). The example
+has no client entrypoint, no personal modpack dependency, and no LLM/HTTP,
+SQLite, memory, or command access.
 
 ## Configuration v3
 

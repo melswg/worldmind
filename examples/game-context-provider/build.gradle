@@ -1,0 +1,47 @@
+plugins {
+    id "fabric-loom"
+}
+
+base {
+    archivesName = "worldmind-game-context-provider-example"
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${minecraft_version}"
+    mappings "net.fabricmc:yarn:${yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${loader_version}"
+
+    // Worldmind supplies this API at runtime; the example must not compile against its implementation modules.
+    compileOnly project(":game-context-api")
+
+    testImplementation project(":game-context-api")
+    testImplementation platform("org.junit:junit-bom:5.10.2")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+java {
+    withSourcesJar()
+}
+
+tasks.register("verifyWorldmindPublicApiOnly") {
+    doLast {
+        def worldmindProjects = configurations.compileClasspath.allDependencies
+            .findAll { it instanceof org.gradle.api.artifacts.ProjectDependency }
+            .collect { it.dependencyProject.path }
+        if (worldmindProjects != [":game-context-api"]) {
+            throw new GradleException("The example may depend on Worldmind only through :game-context-api; found " + worldmindProjects)
+        }
+    }
+}
+
+tasks.named("check") {
+    dependsOn tasks.named("verifyWorldmindPublicApiOnly")
+}

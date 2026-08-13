@@ -265,6 +265,10 @@ public final class GameContextExtensionRuntime implements CurrentGameContextReso
     }
 
     private CompletionStage<Void> cleanupProviderStage(GameContextRegistrationCatalog.RegisteredProvider provider) {
+        cancelProviderInvocations(provider);
+        // Java cannot terminate code that ignores interruption. Never start a
+        // second provider callback beside that one abandoned daemon worker.
+        if (provider.abandonedWorker()) return CompletableFuture.completedFuture(null);
         if (!cleanedSources.add(provider.source().canonicalName())) return CompletableFuture.completedFuture(null);
         return invoke(provider, () -> provider.provider().onCleanup(), false, true).handle((ignored, failure) -> null);
     }
@@ -321,6 +325,10 @@ public final class GameContextExtensionRuntime implements CurrentGameContextReso
 
     private void cancelActiveInvocations() {
         List.copyOf(invocations).forEach(Invocation::cancel);
+    }
+
+    private void cancelProviderInvocations(GameContextRegistrationCatalog.RegisteredProvider provider) {
+        List.copyOf(invocations).stream().filter(invocation -> invocation.provider == provider).forEach(Invocation::cancel);
     }
 
     private static void cancelStage(CompletionStage<?> stage) {

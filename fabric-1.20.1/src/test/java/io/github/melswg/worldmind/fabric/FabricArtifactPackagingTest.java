@@ -1,6 +1,7 @@
 package io.github.melswg.worldmind.fabric;
 
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -24,6 +25,8 @@ class FabricArtifactPackagingTest {
                 "The Fabric artifact must nest the public game-context API.");
             assertNotNull(outer.getEntry("META-INF/jars/game-context-runtime-0.1.0-SNAPSHOT.jar"),
                 "The Fabric artifact must nest the internal game-context runtime.");
+            assertNull(outer.stream().filter(entry -> entry.getName().contains("game-context-provider-example")).findFirst().orElse(null),
+                "Worldmind must not bundle its independently built external-mod example.");
             ZipEntry nestedJdbc = outer.getEntry("META-INF/jars/sqlite-jdbc-3.53.1.0.jar");
             assertNotNull(nestedJdbc, "The Fabric artifact must nest sqlite-jdbc.");
             Set<String> entries = new HashSet<>();
