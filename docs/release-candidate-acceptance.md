@@ -49,3 +49,37 @@ and pass/fail. Do not record a personal path, world name, player content, or
 credential. `localIntegratedSmokeRecordCheck` supplies deterministic
 logical-server parity evidence; it does not pretend to automate this graphical
 operator step.
+
+## Tag-only publication gate
+
+Publication is gated by `.github/workflows/release.yml`, which triggers only on
+pushed `v*.*.*` tags and on an inputless `workflow_dispatch` dry run. The
+workflow keeps `contents: read` permissions for preflight and verify; only the
+publish job receives `contents: write`, `id-token: write`, and `attestations:
+write`, and it runs only when every gate is green and the protected `release`
+environment approves.
+
+Before a tag push is allowed to reach the publish job, `releaseTagPreflight`
+requires the tag to be an annotated semantic version, to resolve to the
+checked-out commit, and that commit to be an ancestor of `origin/main`; the tag
+version must match the Gradle release build property, the rebuilt Fabric
+metadata, and `docs/releases/v<version>.md`. The verify job then reruns the
+full deterministic dry run:
+
+```text
+./gradlew clean releaseDryRun -PreleaseVersion=0.1.0 -PreleaseTag=v0.1.0
+./gradlew releaseWorkflowContract
+```
+
+`releaseDryRun` rebuilds everything from the same committed HEAD, reruns every
+scan/audit/candidate gate and the dedicated-server smoke, and stages only the
+five public assets (`worldmind-fabric-1.20.1-0.1.0.jar`,
+`worldmind-game-context-api-0.1.0.jar`,
+`worldmind-game-context-api-0.1.0-sources.jar`,
+`worldmind-v0.1.0-release-metadata.json`, `SHA256SUMS`) beneath
+`build/release/v0.1.0/`. `releaseWorkflowContract` parses `release.yml` and
+simulates branch, PR, schedule, dispatch, invalid-tag, disabled-variable,
+unapproved-environment, and failed-gate contexts, proving that only a valid
+pushed tag with the release enable variable, environment approval and a green
+verify job can publish. No dry run creates a tag, a GitHub Release, a package
+publication, or any real provider traffic.

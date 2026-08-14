@@ -16,6 +16,7 @@ dependencies {
     testImplementation project(":fabric-1.20.1")
     testImplementation platform("org.junit:junit-bom:5.10.2")
     testImplementation "org.junit.jupiter:junit-jupiter"
+    testImplementation "org.yaml:snakeyaml:2.2"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
     testRuntimeOnly "com.google.code.gson:gson:2.10.1"
     testImplementation files(project(":fabric-1.20.1").sourceSets.main.compileClasspath)
@@ -23,6 +24,8 @@ dependencies {
 
 def auditMain = "io.github.melswg.worldmind.releaseverification.ReleaseAuditMain"
 def releaseCandidateMain = "io.github.melswg.worldmind.releaseverification.ReleaseCandidateMain"
+def releasePreflightMain = "io.github.melswg.worldmind.releaseverification.ReleasePreflightMain"
+def releaseAssetMain = "io.github.melswg.worldmind.releaseverification.ReleaseAssetMain"
 def dedicatedServerSmokeMain = "io.github.melswg.worldmind.releaseverification.DedicatedServerSmokeMain"
 def manualIntegratedSmokeFixtureMain = "io.github.melswg.worldmind.releaseverification.ManualIntegratedSmokeFixtureMain"
 def reportDirectory = layout.buildDirectory.dir("reports/release-verification")
@@ -30,12 +33,14 @@ def remappedArtifact = rootProject.layout.projectDirectory.file(
     "fabric-1.20.1/build/libs/worldmind-fabric-1.20.1-${project.version}.jar"
 )
 def releaseVersion = rootProject.version.toString()
+def releaseTag = providers.gradleProperty("releaseTag").orElse("v" + releaseVersion)
 def candidateDirectory = rootProject.layout.buildDirectory.dir("release-candidate/${releaseVersion}")
 def candidateArtifact = candidateDirectory.map { directory ->
     directory.file("worldmind-fabric-1.20.1-${releaseVersion}.jar")
 }
 def candidateManifest = candidateDirectory.map { directory -> directory.file("release-candidate-manifest.json") }
 def candidateReportDirectory = candidateDirectory.map { directory -> directory.dir("reports") }
+def releaseAssetsDirectory = rootProject.layout.buildDirectory.dir("release/${releaseVersion}")
 def projectBuildTasks = rootProject.subprojects.collect { project -> "${project.path}:build" }
 
 configurations {
@@ -216,4 +221,73 @@ tasks.register("releaseCandidateVerification") {
     dependsOn(projectBuildTasks, tasks.named("releaseAudit"), tasks.named("releaseCandidateArtifactAudit"),
         tasks.named("dedicatedServerSmoke"), tasks.named("localIntegratedSmokeRecordCheck"),
         tasks.named("verifyReleaseCandidateHash"), tasks.named("generatedOutputSecretScan"))
+}
+
+tasks.register("releaseTagContract", JavaExec) {
+    group = "verification"
+    description = "Validates tag format, tag/version consistency, release notes, and rebuilt Fabric metadata."
+    dependsOn(":fabric-1.20.1:processResources")
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = releasePreflightMain
+    args rootProject.projectDir.absolutePath, "contract", releaseTag.get(), releaseVersion,
+        reportDirectory.get().file("release-tag-contract.json").asFile.absolutePath
+}
+
+tasks.register("releaseTagPreflight", JavaExec) {
+    group = "verification"
+    description = "Full pushed-tag preflight: annotated tag, checked-out commit, origin/main ancestry, versions, notes, and metadata."
+    dependsOn(":fabric-1.20.1:processResources")
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = releasePreflightMain
+    args rootProject.projectDir.absolutePath, "preflight", releaseTag.get(), releaseVersion,
+        reportDirectory.get().file("release-tag-preflight.json").asFile.absolutePath
+}
+
+tasks.register("stageReleaseAssets", Sync) {
+    group = "verification"
+    description = "Stages the exact public release asset allowlist from the audited candidate and API JARs."
+    dependsOn(tasks.named("stageReleaseCandidate"), ":game-context-api:jar", ":game-context-api:sourcesJar")
+    from(candidateArtifact.get().asFile)
+    from(rootProject.layout.projectDirectory.file("game-context-api/build/libs/game-context-api-${releaseVersion}.jar")) {
+        rename { "worldmind-game-context-api-${releaseVersion}.jar" }
+    }
+    from(rootProject.layout.projectDirectory.file("game-context-api/build/libs/game-context-api-${releaseVersion}-sources.jar")) {
+        rename { "worldmind-game-context-api-${releaseVersion}-sources.jar" }
+    }
+    into(releaseAssetsDirectory)
+}
+
+tasks.register("verifyReleaseAssets", JavaExec) {
+    group = "verification"
+    description = "Writes release metadata and SHA256SUMS, then rejects stale, extra, or mismatched public assets."
+    dependsOn(tasks.named("stageReleaseAssets"), tasks.named("releaseCandidateManifest"))
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = releaseAssetMain
+    args rootProject.projectDir.absolutePath,
+        releaseAssetsDirectory.get().asFile.absolutePath,
+        candidateManifest.get().asFile.absolutePath,
+        releaseVersion, releaseTag.get(),
+        System.getProperty("java.version"),
+        rootProject.property("minecraft_version"),
+        rootProject.property("loader_version"),
+        rootProject.property("yarn_mappings"),
+        reportDirectory.get().file("release-assets.json").asFile.absolutePath
+}
+
+tasks.register("releaseWorkflowContract", Test) {
+    group = "verification"
+    description = "Parser-based contract test of release.yml plus simulated publication contexts."
+    useJUnitPlatform()
+    filter.includeTestsMatching("io.github.melswg.worldmind.releaseverification.ReleaseWorkflowContractTest")
+}
+
+tasks.register("releaseDryRun") {
+    group = "verification"
+    description = "Deterministic tag-versioned clean rebuild with full gates, candidate integrity, dedicated smoke, and staged public assets."
+    dependsOn(tasks.named("releaseTagContract"), tasks.named("releaseCandidateVerification"),
+        tasks.named("verifyReleaseAssets"), tasks.named("generatedOutputSecretScan"))
+}
+
+tasks.named("generatedOutputSecretScan") {
+    mustRunAfter(tasks.named("verifyReleaseAssets"))
 }
