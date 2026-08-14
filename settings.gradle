@@ -11,5 +11,5 @@ pluginManagement {
 
 rootProject.name = "worldmind"
 
-include("core", "fabric-1.20.1", "sqlite-storage", "testkit", "game-context-api", "game-context-runtime", "example-game-context-provider")
+include("core", "fabric-1.20.1", "sqlite-storage", "testkit", "game-context-api", "game-context-runtime", "example-game-context-provider", "release-verification")
 project(":example-game-context-provider").projectDir = file("examples/game-context-provider")

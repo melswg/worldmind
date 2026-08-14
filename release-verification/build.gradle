@@ -1,0 +1,70 @@
+plugins {
+    id "java"
+}
+
+repositories {
+    maven {
+        name = "Fabric"
+        url = "https://maven.fabricmc.net/"
+    }
+}
+
+dependencies {
+    testImplementation project(":core")
+    testImplementation project(":sqlite-storage")
+    testImplementation project(":testkit")
+    testImplementation project(":fabric-1.20.1")
+    testImplementation platform("org.junit:junit-bom:5.10.2")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+    testRuntimeOnly "com.google.code.gson:gson:2.10.1"
+}
+
+def auditMain = "io.github.melswg.worldmind.releaseverification.ReleaseAuditMain"
+def reportDirectory = layout.buildDirectory.dir("reports/release-verification")
+def remappedArtifact = rootProject.layout.projectDirectory.file(
+    "fabric-1.20.1/build/libs/worldmind-fabric-1.20.1-${project.version}.jar"
+)
+
+tasks.register("sourceSecretScan", JavaExec) {
+    group = "verification"
+    description = "Scans version-controlled source and candidate untracked files without printing matches."
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = auditMain
+    args rootProject.projectDir.absolutePath, "source", reportDirectory.get().file("source-secret-scan.json").asFile.absolutePath
+}
+
+tasks.register("generatedOutputSecretScan", JavaExec) {
+    group = "verification"
+    description = "Scans generated reports and release outputs without printing matches."
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = auditMain
+    args rootProject.projectDir.absolutePath, "generated", reportDirectory.get().file("generated-output-secret-scan.json").asFile.absolutePath
+    mustRunAfter(tasks.named("runtimeCanaryAcceptance"))
+}
+
+tasks.register("releaseArtifactAudit", JavaExec) {
+    group = "verification"
+    description = "Audits the exact remapped Fabric artifact, metadata, licenses, natives, and scope boundaries."
+    dependsOn(":fabric-1.20.1:remapJar")
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = auditMain
+    args rootProject.projectDir.absolutePath, "artifact", reportDirectory.get().file("artifact-audit.json").asFile.absolutePath,
+        remappedArtifact.asFile.absolutePath, project.version
+    mustRunAfter(tasks.named("runtimeCanaryAcceptance"))
+}
+
+tasks.register("runtimeCanaryAcceptance", Test) {
+    group = "verification"
+    description = "Runs redaction canaries through loopback provider, SQLite, diagnostics, backups, and export boundaries."
+    useJUnitPlatform()
+    filter.includeTestsMatching("io.github.melswg.worldmind.fabric.RedactionStorageCanaryTest")
+    filter.includeTestsMatching("io.github.melswg.worldmind.fabric.provider.ProviderTransportCanaryTest")
+}
+
+tasks.register("releaseAudit") {
+    group = "verification"
+    description = "Runs all deterministic release security and artifact verification gates."
+    dependsOn(tasks.named("sourceSecretScan"), tasks.named("runtimeCanaryAcceptance"),
+        tasks.named("releaseArtifactAudit"), tasks.named("generatedOutputSecretScan"))
+}

@@ -15,6 +15,7 @@ class WorldmindFabricMetadataTest {
 
         assertTrue(metadata.contains("\"id\": \"worldmind\""));
         assertTrue(metadata.contains("\"minecraft\": \"~1.20.1\""));
+        assertTrue(metadata.contains("\"license\": \"Apache-2.0\""));
         assertTrue(metadata.contains("\"environment\": \"*\""));
         assertTrue(metadata.contains("\"main\""));
         assertTrue(metadata.contains("\"fabric-message-api-v1\""));

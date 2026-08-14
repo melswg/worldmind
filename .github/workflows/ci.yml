@@ -44,9 +44,20 @@ jobs:
         shell: bash
         run: ./gradlew --version --no-daemon
 
+      - name: Scan source and fixtures before build
+        id: source-scan
+        shell: bash
+        run: ./gradlew :release-verification:sourceSecretScan --no-daemon
+
       - name: Build all Java 17 shards
         shell: bash
         run: ./gradlew clean build --no-daemon
+
+      - name: Run runtime redaction canary and release artifact audit
+        shell: bash
+        run: >-
+          ./gradlew :release-verification:runtimeCanaryAcceptance
+          :release-verification:releaseArtifactAudit --no-daemon
 
       - name: Run logical-server lifecycle shard
         shell: bash
@@ -61,6 +72,30 @@ jobs:
         run: >-
           ./gradlew :fabric-1.20.1:test --no-daemon
           --tests io.github.melswg.worldmind.fabric.FabricArtifactPackagingTest
+
+      - name: Scan generated reports and release outputs
+        id: generated-scan
+        if: always()
+        shell: bash
+        run: ./gradlew :release-verification:generatedOutputSecretScan --no-daemon
+
+      - name: Upload sanitized release audit reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: worldmind-release-audit-${{ matrix.os }}-${{ github.sha }}
+          path: release-verification/build/reports/release-verification/*.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload raw test reports after scan
+        if: always() && steps.generated-scan.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: worldmind-test-reports-${{ matrix.os }}-${{ github.sha }}
+          path: '**/build/reports/tests/**'
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload remapped artifact
         if: success()
