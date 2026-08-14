@@ -18,16 +18,42 @@ dependencies {
     testImplementation "org.junit.jupiter:junit-jupiter"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
     testRuntimeOnly "com.google.code.gson:gson:2.10.1"
+    testImplementation files(project(":fabric-1.20.1").sourceSets.main.compileClasspath)
 }
 
 def auditMain = "io.github.melswg.worldmind.releaseverification.ReleaseAuditMain"
+def releaseCandidateMain = "io.github.melswg.worldmind.releaseverification.ReleaseCandidateMain"
+def dedicatedServerSmokeMain = "io.github.melswg.worldmind.releaseverification.DedicatedServerSmokeMain"
+def manualIntegratedSmokeFixtureMain = "io.github.melswg.worldmind.releaseverification.ManualIntegratedSmokeFixtureMain"
 def reportDirectory = layout.buildDirectory.dir("reports/release-verification")
 def remappedArtifact = rootProject.layout.projectDirectory.file(
     "fabric-1.20.1/build/libs/worldmind-fabric-1.20.1-${project.version}.jar"
 )
+def releaseVersion = rootProject.version.toString()
+def candidateDirectory = rootProject.layout.buildDirectory.dir("release-candidate/${releaseVersion}")
+def candidateArtifact = candidateDirectory.map { directory ->
+    directory.file("worldmind-fabric-1.20.1-${releaseVersion}.jar")
+}
+def candidateManifest = candidateDirectory.map { directory -> directory.file("release-candidate-manifest.json") }
+def candidateReportDirectory = candidateDirectory.map { directory -> directory.dir("reports") }
+def projectBuildTasks = rootProject.subprojects.collect { project -> "${project.path}:build" }
+
+configurations {
+    dedicatedServerSmokeModules
+}
+
+dependencies {
+    dedicatedServerSmokeModules "net.fabricmc.fabric-api:fabric-lifecycle-events-v1:${rootProject.property("fabric_lifecycle_events_version") }"
+    dedicatedServerSmokeModules "net.fabricmc.fabric-api:fabric-message-api-v1:${rootProject.property("fabric_message_api_version") }"
+    dedicatedServerSmokeModules "net.fabricmc.fabric-api:fabric-command-api-v2:2.2.14+1802ada577"
+}
 
 tasks.withType(Test).configureEach {
     systemProperty "worldmind.project.root", rootProject.projectDir.absolutePath
+}
+
+tasks.named("test", Test) {
+    exclude "**/ReleaseCandidateLogicalServerParityTest.class"
 }
 
 tasks.register("sourceSecretScan", JavaExec) {
@@ -78,4 +104,116 @@ tasks.register("releaseAudit") {
     description = "Runs all deterministic release security and artifact verification gates."
     dependsOn(tasks.named("sourceSecretScan"), tasks.named("runtimeCanaryAcceptance"), tasks.named("documentationCheck"),
         tasks.named("releaseArtifactAudit"), tasks.named("generatedOutputSecretScan"))
+}
+
+tasks.register("stageReleaseCandidate", Sync) {
+    group = "verification"
+    description = "Stages the exact remapped Fabric JAR that every release-candidate check consumes."
+    dependsOn(":fabric-1.20.1:remapJar")
+    mustRunAfter(projectBuildTasks)
+    from(remappedArtifact)
+    into(candidateDirectory)
+}
+
+tasks.register("releaseCandidateAuthorship", JavaExec) {
+    group = "verification"
+    description = "Verifies the repository-local author and committer sequence from the approved baseline."
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = releaseCandidateMain
+    args rootProject.projectDir.absolutePath, "authorship"
+}
+
+tasks.register("releaseCandidateArtifactAudit", JavaExec) {
+    group = "verification"
+    description = "Audits the staged, immutable remapped JAR rather than a build output by name."
+    dependsOn(tasks.named("stageReleaseCandidate"))
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = auditMain
+    args rootProject.projectDir.absolutePath, "artifact",
+        candidateReportDirectory.get().file("artifact-audit.json").asFile.absolutePath,
+        candidateArtifact.get().asFile.absolutePath, releaseVersion
+}
+
+tasks.register("releaseCandidateManifest", JavaExec) {
+    group = "verification"
+    description = "Records the candidate filename, source commit, SHA-256, and acceptance evidence."
+    dependsOn(tasks.named("releaseCandidateArtifactAudit"), tasks.named("releaseCandidateAuthorship"))
+    mustRunAfter(projectBuildTasks)
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = releaseCandidateMain
+    args rootProject.projectDir.absolutePath, "create", candidateArtifact.get().asFile.absolutePath,
+        candidateManifest.get().asFile.absolutePath, releaseVersion
+    outputs.file(candidateManifest)
+}
+
+tasks.register("dedicatedServerSmoke", JavaExec) {
+    group = "verification"
+    description = "Starts a disposable headless Fabric dedicated server from the exact staged candidate and shuts it down."
+    dependsOn(tasks.named("releaseCandidateManifest"))
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = dedicatedServerSmokeMain
+    args candidateArtifact.get().asFile.absolutePath,
+        rootProject.layout.buildDirectory.file("release-verification/fabric-server-launcher-1.20.1-0.15.11-1.1.2.jar").get().asFile.absolutePath,
+        rootProject.layout.buildDirectory.dir("release-verification/dedicated-server/${releaseVersion}").get().asFile.absolutePath,
+        candidateReportDirectory.get().file("dedicated-server-smoke.json").asFile.absolutePath,
+        releaseVersion
+    doFirst {
+        def requiredModulePrefixes = ["fabric-api-base-", "fabric-lifecycle-events-v1-", "fabric-message-api-v1-", "fabric-command-api-v2-"]
+        def modules = configurations.dedicatedServerSmokeModules.files.findAll { file ->
+            requiredModulePrefixes.any { prefix -> file.name.startsWith(prefix) }
+        }.sort { it.name }
+        if (modules.size() != requiredModulePrefixes.size()) {
+            throw new GradleException("Dedicated smoke requires the pinned Fabric API modules and fabric-api-base.")
+        }
+        args modules.collect { it.absolutePath }
+    }
+    outputs.file(candidateReportDirectory.map { it.file("dedicated-server-smoke.json") })
+}
+
+tasks.register("localIntegratedSmokeRecordCheck", Test) {
+    group = "verification"
+    description = "Runs the deterministic no-client logical-server parity check and validates the local manual-smoke instructions."
+    dependsOn(tasks.named("releaseCandidateManifest"))
+    systemProperty "worldmind.release.candidate", candidateArtifact.get().asFile.absolutePath
+    systemProperty "worldmind.release.manifest", candidateManifest.get().asFile.absolutePath
+    filter.includeTestsMatching("io.github.melswg.worldmind.fabric.ReleaseCandidateLogicalServerParityTest")
+}
+
+tasks.register("prepareManualIntegratedSmokeFixture", JavaExec) {
+    group = "verification"
+    description = "Writes an isolated synthetic profile/config tree for the human integrated-server smoke."
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = manualIntegratedSmokeFixtureMain
+    args "prepare", rootProject.layout.buildDirectory.dir("manual-integrated-smoke-fixture").get().asFile.absolutePath
+    outputs.dir(rootProject.layout.buildDirectory.dir("manual-integrated-smoke-fixture"))
+}
+
+tasks.register("manualIntegratedFakeProvider", JavaExec) {
+    group = "verification"
+    description = "Serves a fixed response only on 127.0.0.1 for the human integrated-server smoke."
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = manualIntegratedSmokeFixtureMain
+    args "serve"
+}
+
+tasks.register("verifyReleaseCandidateHash", JavaExec) {
+    group = "verification"
+    description = "Fails if any downstream check changed the staged remapped candidate after its SHA-256 was recorded."
+    dependsOn(tasks.named("releaseCandidateManifest"), tasks.named("dedicatedServerSmoke"), tasks.named("localIntegratedSmokeRecordCheck"))
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = releaseCandidateMain
+    args rootProject.projectDir.absolutePath, "verify", candidateArtifact.get().asFile.absolutePath,
+        candidateManifest.get().asFile.absolutePath, releaseVersion
+}
+
+tasks.named("generatedOutputSecretScan") {
+    mustRunAfter(tasks.named("verifyReleaseCandidateHash"))
+}
+
+tasks.register("releaseCandidateVerification") {
+    group = "verification"
+    description = "Runs all v0.1 release gates against one immutable staged remapped JAR."
+    dependsOn(projectBuildTasks, tasks.named("releaseAudit"), tasks.named("releaseCandidateArtifactAudit"),
+        tasks.named("dedicatedServerSmoke"), tasks.named("localIntegratedSmokeRecordCheck"),
+        tasks.named("verifyReleaseCandidateHash"), tasks.named("generatedOutputSecretScan"))
 }

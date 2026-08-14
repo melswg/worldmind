@@ -3,9 +3,13 @@ plugins {
     id "fabric-loom" version "${loom_version}" apply false
 }
 
+def effectiveReleaseVersion = providers.gradleProperty("releaseVersion")
+    .orElse(providers.gradleProperty("mod_version"))
+    .get()
+
 allprojects {
     group = "io.github.melswg.worldmind"
-    version = project.mod_version
+    version = effectiveReleaseVersion
 
     repositories {
         mavenCentral()
@@ -28,6 +32,11 @@ subprojects {
         tasks.withType(Test).configureEach {
             useJUnitPlatform()
         }
+    }
+
+    tasks.withType(org.gradle.api.tasks.bundling.AbstractArchiveTask).configureEach {
+        preserveFileTimestamps = false
+        reproducibleFileOrder = true
     }
 
     tasks.withType(Jar).configureEach {
