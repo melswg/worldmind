@@ -5,6 +5,11 @@ small, structured, public game-context data to contribute to a conversation.
 The API artifact and all supported types live in
 `io.github.melswg.worldmind.api.gamecontext.v1`.
 
+Worldmind v0.1 publishes this API as a developer artifact alongside the remapped
+server mod. It is the only supported external integration boundary; it never
+creates a client entrypoint or grants provider, memory, credential, command, or
+server-handle access.
+
 This is an extension-context API, not an LLM-provider registry. It exposes no
 Worldmind core/Fabric implementation classes, LanguageModel or HTTP transport,
 SQLite or memory access, credentials, commands, player/world handles, client

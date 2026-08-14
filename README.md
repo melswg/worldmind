@@ -1,204 +1,60 @@
 # Worldmind
 
-Worldmind is a planned server-first Fabric mod that brings a configurable AI
-character to Minecraft server chat.
+Worldmind v0.1 is a server-first Fabric mod for Minecraft 1.20.1. It observes
+accepted public server chat, batches ambient discussion, and lets one configured
+character reply or remain silent. Authoritative work runs on the logical server:
+dedicated-server players do not need a Worldmind client mod.
 
-## Project status
+## Compatibility
 
-This repository contains server-first lifecycle, bounded public-chat batching,
-typed participation decisions, SQLite memory, strict configuration/profile
-loading with backups, redaction, retry/circuit protection, and three supported
-Chat Completions provider presets: custom OpenAI-compatible, OpenRouter, and
-direct DeepSeek.
-
-Required tests use only a loopback fake provider with synthetic credentials;
-Worldmind ships no real-provider smoke task and never discovers user credentials
-automatically.
-
-## Target platform
-
-- Minecraft 1.20.1
-- Fabric
+- Minecraft 1.20.1 and Fabric Loader 0.15.11 or newer
 - Java 17
+- Linux, macOS, and Windows, with bundled SQLite JDBC natives
+- Apache-2.0
 
-Worldmind is designed to keep its authoritative logic on the logical Minecraft
-server, so the same path can serve dedicated servers and single-player worlds.
+An integrated single-player world is also a logical server. Put the common
+Worldmind JAR in that instance when hosting such a world; Worldmind still has no
+client entrypoint, screen, packet protocol, or required client-side feature.
 
-## Modules
+## Install safely
 
-- `core` — Minecraft-independent authoritative bootstrap, public-chat batching,
-  participation-decision protocol, and future domain code.
-- `fabric-1.20.1` — Fabric lifecycle adapter and the distributable mod artifact.
-- `game-context-api` — versioned, dependency-free public API for external
-  Fabric game-context providers.
-- `game-context-runtime` — Worldmind-private bounded invocation and lifecycle
-  runtime; it is packaged inside the Worldmind Fabric artifact, not supported
-  as an external API.
-- `testkit` — deterministic acceptance seam with a fake LLM, controlled clock,
-  controllable server scheduler, and synthetic vanilla game context. It records
-  stable provider requests and sealed chat batches without a Minecraft client.
+1. Put the remapped `worldmind-fabric-1.20.1-<version>.jar` in the server's
+   `mods/` directory with its required Fabric API modules.
+2. Start once, then create `config/worldmind/worldmind.json` and a portable
+   profile below `config/worldmind/profiles/<profile-id>/` from a synthetic
+   example in [`docs/examples/`](docs/examples/).
+3. Store an API credential outside the profile, Git, MRPACK, logs, memory, and
+   shared LLM Wiki. Use an environment reference such as
+   `env:WORLDMIND_API_KEY`, not a literal key.
+4. Run `/worldmind validate` as an operator before enabling the integration.
 
-## External game-context providers
+Worldmind is safe to leave disabled: Minecraft keeps running when configuration
+or a secret is invalid. It never discovers credentials automatically and the
+repository test suite uses loopback fake providers only.
 
-External Fabric mods can contribute small structured public context through the
-versioned `game-context-api` artifact and the
-`worldmind-game-context-v1` entrypoint. Worldmind invokes this API on bounded
-daemon workers, not on the Minecraft server thread. Returned values are always
-source-attributed untrusted `CURRENT_GAME_CONTEXT`; they cannot change trusted
-rules, persona, participation, memory, transport, or delivery.
+## Guides
 
-See [the v0.1 API guide](docs/game-context-api-v0.1.md) and the independently
-compilable [external-mod example](examples/game-context-provider). The example
-has no client entrypoint, no personal modpack dependency, and no LLM/HTTP,
-SQLite, memory, or command access.
+- [Operator guide](docs/operator-guide.md)
+- [Configuration reference](docs/configuration.md)
+- [Provider presets](docs/providers.md)
+- [Modpack authoring](docs/modpack-authoring.md)
+- [Memory and privacy](docs/memory-and-privacy.md)
+- [Extension API v0.1](docs/game-context-api-v0.1.md) and [developer guide](docs/development.md)
+- [Upgrade and troubleshooting](docs/upgrade-and-troubleshooting.md)
+- [Compatibility](docs/compatibility.md) and [v0.1.0 release notes](docs/releases/v0.1.0.md)
 
-## Configuration v3
+## Development
 
-At logical-server startup, Worldmind reads
-`config/worldmind/worldmind.json` and the selected portable profile from
-`config/worldmind/profiles/<profile-id>/`. The global document declares
-`"schemaVersion": 3`; the portable profile remains schema v1. Unknown fields
-and invalid provider combinations are rejected before secret resolution or
-HTTP. Startup upgrades v1 through v2 to v3 atomically after publishing one
-backup of the original global/profile bundle.
-
-```json
-{
-  "schemaVersion": 3,
-  "enabled": true,
-  "activeProfile": "oracle",
-  "chatBatching": {
-    "maxMessages": 8,
-    "maxWaitMillis": 5000,
-    "maxEstimatedInputCharacters": 4000
-  },
-  "requestQueue": {
-    "capacity": 16,
-    "maxConcurrency": 2
-  },
-  "dialogueRetention": {
-    "persistRawObservations": true,
-    "maximumRawAgeDays": 0,
-    "useInRecentContext": true,
-    "useInCompaction": true,
-    "useInRetrieval": true
-  },
-  "provider": {
-    "id": "custom-openai-compatible",
-    "endpoint": "https://provider.example/v1/chat/completions",
-    "model": "example-model",
-    "secretReference": "env:WORLDMIND_API_KEY",
-    "timeouts": {"connectMillis": 5000, "responseCompletionMillis": 30000},
-    "retry": {"maximumAttempts": 3, "initialBackoffMillis": 250, "maximumBackoffMillis": 4000, "jitterRatio": 0.2},
-    "circuitBreaker": {"failureThreshold": 5, "cooldownMillis": 30000},
-    "generation": {"temperature": 0.4, "maxOutputTokens": 120}
-  }
-}
+```text
+./gradlew clean build
+./gradlew sourceSecretScan runtimeCanaryAcceptance releaseArtifactAudit
 ```
 
-`chatBatching` is required. It bounds a per-save public-chat batch by
-message count, elapsed time from its first message, and a stable early Unicode
-character estimate. Reaching a limit includes the triggering message and
-seals the batch; it does not impose a reply quota.
+The build is Java 17. Run a remapped-artifact check by setting
+`WORLDMIND_REMAPPED_JAR` to the locally built Fabric JAR and executing
+`./gradlew :fabric-1.20.1:test --tests io.github.melswg.worldmind.fabric.FabricArtifactPackagingTest`.
 
-`requestQueue` is also required. `capacity` is the maximum number of
-waiting conversation or memory-compaction jobs; `maxConcurrency` bounds active
-jobs. Both must be positive integers, so the total owned work cannot exceed
-their sum. Invalid or missing values disable the integration before it accepts
-chat.
-
-The selected profile contains only portable character material in
-`profile.json`, plus the referenced Markdown files:
-
-```json
-{
-  "schemaVersion": 1,
-  "characterName": "Aster",
-  "personaFile": "persona.md",
-  "administratorRulesFile": "rules.md",
-  "loreFiles": ["lore/world.md"],
-  "responseStyle": "calm and concise",
-  "responseLengthLimit": 280,
-  "chatNameColor": "light_purple"
-}
-```
-
-`chatNameColor` is optional and controls only the Worldmind name used in
-server-chat delivery. It defaults to `light_purple` and accepts one exact
-vanilla palette name: `black`, `dark_blue`, `dark_green`, `dark_aqua`,
-`dark_red`, `dark_purple`, `gold`, `gray`, `dark_gray`, `blue`, `green`,
-`aqua`, `red`, `light_purple`, `yellow`, or `white`.
-
-`secretReference` belongs only in the global configuration; portable profiles
-cannot contain it. The bundled resolver accepts `env:NAME`; deployments can
-replace the resolver for another `scheme:opaque-reference`. A missing,
-unreadable, or rejected secret disables only the LLM integration
-and emits field-specific diagnostics; Minecraft keeps running. The profile,
-provider request, diagnostics, and example configuration never contain its
-value. The configured endpoint is the full Chat Completions URI for the custom
-preset only; HTTPS is required except for local loopback HTTP used in tests or
-local development. Built-in presets deliberately reject `endpoint`, so config
-cannot turn them into redirect/open-proxy surfaces.
-Use a separate spending-limited key per deployment; Worldmind never creates or
-manages credentials.
-
-Supported preset selections omit `endpoint`:
-
-```json
-{"id":"openrouter","model":"openai/gpt-4","secretReference":"env:WORLDMIND_OPENROUTER_API_KEY","timeouts":{"connectMillis":5000,"responseCompletionMillis":30000},"retry":{"maximumAttempts":3,"initialBackoffMillis":250,"maximumBackoffMillis":4000,"jitterRatio":0.2},"circuitBreaker":{"failureThreshold":5,"cooldownMillis":30000},"generation":{"maxOutputTokens":120}}
-```
-
-```json
-{"id":"deepseek-direct","model":"deepseek-v4-flash","secretReference":"env:WORLDMIND_DEEPSEEK_API_KEY","timeouts":{"connectMillis":5000,"responseCompletionMillis":30000},"retry":{"maximumAttempts":3,"initialBackoffMillis":250,"maximumBackoffMillis":4000,"jitterRatio":0.2},"circuitBreaker":{"failureThreshold":5,"cooldownMillis":30000},"generation":{"maxOutputTokens":120}}
-```
-
-OpenRouter uses its fixed Chat Completions endpoint and sends no attribution or
-metadata headers. Direct DeepSeek uses its fixed Chat Completions endpoint,
-accepts only `deepseek-v4-flash` or `deepseek-v4-pro`, and explicitly disables
-thinking so configured sampling parameters remain effective. Neither preset
-supports streaming, tools, web search, routing metadata, Responses API, or
-credential management.
-
-`timeouts` is required. `connectMillis` bounds a new TCP/TLS connection;
-`responseCompletionMillis` bounds the complete HTTP exchange and response body.
-
-`retry` is required. Only connection loss, timeouts, HTTP 429, and 5xx
-responses retry; the first attempt is included in `maximumAttempts`.
-
-`circuitBreaker` is required. After the configured count of qualifying
-terminal provider failures, Worldmind stops HTTP calls for `cooldownMillis` and
-allows only one recovery probe.
-
-## Prompt and chat safety
-
-The provider-visible conversation always has this fixed order: built-in safety
-policy and participation protocol, administrator rules, persona, lore, memory,
-current game context, then the current public-chat batch. Lore, memory, game
-context, and every player message remain source-attributed untrusted data;
-they cannot create another prompt layer, system message, tool call, or chat
-delivery path.
-
-Worldmind uses documented internal, provider-neutral Unicode code-point estimates:
-12,000 for total input, 2,400 per untrusted layer, and 900 per serialized chat
-fragment. They are not token counts and are intentionally not configuration
-fields. When input is excessive, future memory, lore, game context, and then
-older chat data are removed first. The newest triggering chat fragment keeps
-its stable source attribution and carries a truncation marker when shortened.
-If the mandatory trusted prompt cannot fit, Worldmind makes no provider request
-and returns a controlled failure to the existing delivery path.
-
-Provider output is decoded once by the participation protocol. Reply text is
-then normalized, stripped of formatting/control and directional characters, and
-limited by the configured `responseLengthLimit` using Unicode code points. The
-Fabric adapter always constructs literal components, so command-looking text,
-URLs, JSON, or click-event-looking output has no executable or interactive
-meaning. No configuration changes are needed for these safety boundaries.
-
-## Build
-
-Run `./gradlew build` with Java 17. The build runs ordinary core tests and
-server-side Fabric smoke tests; no client-side Worldmind entrypoint is present.
-
-## License
-
-Worldmind is licensed under the [Apache License 2.0](LICENSE).
+Worldmind v0.1 does not add an AI entity, pathfinding, world or inventory
+actions, Minecraft command/tool execution, TTS/STT, web search, embeddings,
+vector databases, a client mod, GUI, or support for Minecraft versions other
+than 1.20.1.

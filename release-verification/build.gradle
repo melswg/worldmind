@@ -26,6 +26,10 @@ def remappedArtifact = rootProject.layout.projectDirectory.file(
     "fabric-1.20.1/build/libs/worldmind-fabric-1.20.1-${project.version}.jar"
 )
 
+tasks.withType(Test).configureEach {
+    systemProperty "worldmind.project.root", rootProject.projectDir.absolutePath
+}
+
 tasks.register("sourceSecretScan", JavaExec) {
     group = "verification"
     description = "Scans version-controlled source and candidate untracked files without printing matches."
@@ -62,9 +66,16 @@ tasks.register("runtimeCanaryAcceptance", Test) {
     filter.includeTestsMatching("io.github.melswg.worldmind.fabric.provider.ProviderTransportCanaryTest")
 }
 
+tasks.register("documentationCheck", Test) {
+    group = "verification"
+    description = "Checks documentation links, required v0.1 boundaries, and parseable synthetic configuration examples."
+    useJUnitPlatform()
+    filter.includeTestsMatching("io.github.melswg.worldmind.fabric.configuration.DocumentationContractTest")
+}
+
 tasks.register("releaseAudit") {
     group = "verification"
     description = "Runs all deterministic release security and artifact verification gates."
-    dependsOn(tasks.named("sourceSecretScan"), tasks.named("runtimeCanaryAcceptance"),
+    dependsOn(tasks.named("sourceSecretScan"), tasks.named("runtimeCanaryAcceptance"), tasks.named("documentationCheck"),
         tasks.named("releaseArtifactAudit"), tasks.named("generatedOutputSecretScan"))
 }

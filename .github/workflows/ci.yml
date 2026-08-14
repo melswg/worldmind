@@ -53,10 +53,10 @@ jobs:
         shell: bash
         run: ./gradlew clean build --no-daemon
 
-      - name: Run runtime redaction canary and release artifact audit
+      - name: Verify documentation, runtime redaction canary, and release artifact
         shell: bash
         run: >-
-          ./gradlew :release-verification:runtimeCanaryAcceptance
+          ./gradlew :release-verification:documentationCheck :release-verification:runtimeCanaryAcceptance
           :release-verification:releaseArtifactAudit --no-daemon
 
       - name: Run logical-server lifecycle shard
